@@ -46,6 +46,12 @@ cp server/.env.example server/.env
 node -e "const f='server/.env',fs=require('fs');fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace(/^JWT_SECRET=$/m,'JWT_SECRET='+require('crypto').randomBytes(48).toString('base64url')))"
 ```
 
+> **npm 12 note.** `npm install` may warn that install scripts were blocked for
+> `better-sqlite3` and `esbuild`. That is expected and nothing needs approving — both ship
+> ready-to-use binaries (better-sqlite3 bundles per-platform prebuilds, esbuild resolves through
+> optional dependencies), so the blocked scripts have nothing left to do. Tests and builds pass
+> without them.
+
 Seed a demo account, then start both servers:
 
 ```bash

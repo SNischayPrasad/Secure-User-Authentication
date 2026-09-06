@@ -102,7 +102,7 @@ performs four checks on every authenticated request:
 
 Checks 3 and 4 are what make revocation real. `POST /auth/logout-all` invalidates live access
 tokens immediately, and changing a password signs out every other device. The cost is one indexed
-SQLite read per request, which is the right trade at this scale.
+read per request, which is the right trade at this scale.
 
 ---
 
@@ -209,7 +209,7 @@ Stated plainly, because an incomplete threat model is itself a risk.
 | No multi-factor authentication | A stolen password is sufficient to sign in. The session model would accommodate MFA, but it is not implemented. |
 | Breached-password list is a bundled sample | Not the full Have I Been Pwned corpus; a k-anonymity range query would be the production answer. |
 | Lockout is a denial-of-service lever | Someone who knows an email can lock it for 15 minutes at a time. The usual mitigations are a CAPTCHA or risk-based throttling. |
-| SQLite, single node | Correct for a reference implementation. Sessions and audit rows would need a real database to scale horizontally. |
+| Rate limiting is per instance | Counters live in process memory, so a serverless deployment enforces them per warm instance rather than globally. Account lockout is unaffected — it is stored in Postgres. A shared store (Redis) is the production answer. |
 | Rate limiting is in-process | Counters are per instance and reset on restart. A shared store is needed behind multiple instances. |
 | HTTPS terminates upstream | The app serves plain HTTP; `Secure` cookies assume a TLS-terminating proxy in front. |
 | Audit log stores IP and user agent | Personal data under GDPR-style regimes. A real deployment needs a retention policy. |

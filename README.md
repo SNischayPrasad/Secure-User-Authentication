@@ -5,7 +5,8 @@ Argon2id password hashing, short-lived JWT access tokens, opaque refresh tokens 
 every use with **reuse detection**, session revocation that cuts off tokens that have not expired
 yet, and a protected resource that returns data only to the account that owns it.
 
-Full stack: an Express 5 + TypeScript API over SQLite, and a React 19 + Vite client.
+Full stack: an Express 5 + TypeScript API over PostgreSQL, and a React 19 + Vite client.
+Deployable to Vercel as-is.
 
 <p align="center">
   <img src="docs/screenshots/01-landing.png" alt="The landing page: a credential card with guilloche linework, a foil seal, and a live machine-readable zone" width="900">
@@ -23,6 +24,7 @@ Full stack: an Express 5 + TypeScript API over SQLite, and a React 19 + Vite cli
 - [Error codes](#error-codes)
 - [Project layout](#project-layout)
 - [Testing](#testing)
+- [Deploying to Vercel](#deploying-to-vercel)
 - [Configuration](#configuration)
 - [What is deliberately not here](#what-is-deliberately-not-here)
 
@@ -31,7 +33,9 @@ Full stack: an Express 5 + TypeScript API over SQLite, and a React 19 + Vite cli
 ## Quick start
 
 Requires **Node.js 20.11 or newer**. There is no database server to install and nothing to
-compile — SQLite and Argon2id both ship as prebuilt binaries.
+compile. Locally the API runs [PGlite](https://pglite.dev) — PostgreSQL compiled to WebAssembly
+and executed in-process — so `npm install` is the whole setup. Production points the same code at
+a managed Postgres by setting `DATABASE_URL`; the SQL is identical either way.
 
 ```bash
 git clone https://github.com/SNischayPrasad/Secure-User-Authentication.git
@@ -46,11 +50,9 @@ cp server/.env.example server/.env
 node -e "const f='server/.env',fs=require('fs');fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace(/^JWT_SECRET=$/m,'JWT_SECRET='+require('crypto').randomBytes(48).toString('base64url')))"
 ```
 
-> **npm 12 note.** `npm install` may warn that install scripts were blocked for
-> `better-sqlite3` and `esbuild`. That is expected and nothing needs approving — both ship
-> ready-to-use binaries (better-sqlite3 bundles per-platform prebuilds, esbuild resolves through
-> optional dependencies), so the blocked scripts have nothing left to do. Tests and builds pass
-> without them.
+> **npm 12 note.** `npm install` may warn that an install script was blocked for `esbuild`.
+> That is expected and nothing needs approving — esbuild resolves its binary through optional
+> dependencies, so the blocked script has nothing left to do. Tests and builds pass without it.
 
 Seed a demo account, then start both servers:
 
@@ -289,7 +291,7 @@ server/
     app.ts                     Express app factory (middleware order lives here)
     index.ts                   Entry point, graceful shutdown
     config/env.ts              Zod-validated environment
-    db/                        SQLite connection, schema, migration, seed
+    db/                        Postgres connection (pg / PGlite), schema, migration, seed
     lib/
       password.ts              Argon2id, the password policy, the dummy hash
       tokens.ts                JWT signing and verification, refresh-token minting
@@ -339,6 +341,73 @@ appears nowhere in it.
 
 ---
 
+## Deploying to Vercel
+
+The repository is deployment-ready: `vercel.json` builds the client and exposes the same Express
+app as a serverless function at `api/[...path].ts`. A catch-all function file, rather than a
+rewrite, is what keeps `req.url` as the real path so Express routes on it unchanged — the code
+running in production is the same `createApp()` the test suite drives.
+
+Two things must be set up once, because neither can be inferred.
+
+### 1. A Postgres database
+
+Vercel functions run on a read-only filesystem, so there is nowhere to keep a local database file.
+In the Vercel dashboard open the project, then **Storage → Create Database → Neon (Postgres)**.
+Vercel injects `DATABASE_URL` into the project automatically; the app picks it up and uses
+`node-postgres` instead of PGlite. Nothing else changes — same schema, same SQL.
+
+The schema is applied automatically on the first request after a deploy, so there is no migration
+step to run.
+
+### 2. A signing secret
+
+Under **Settings → Environment Variables** add, for all environments:
+
+| Name | Value |
+|---|---|
+| `JWT_SECRET` | at least 32 characters of randomness |
+
+Generate one with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+```
+
+The server **refuses to boot in production without it** rather than falling back to a default
+key, so a missing secret fails loudly at deploy time instead of shipping a forgeable token. If
+you see `SERVER_MISCONFIGURED` from the API, this is why.
+
+### 3. Deploy
+
+Import the repository at [vercel.com/new](https://vercel.com/new) and accept the detected
+settings — `vercel.json` already specifies the build command, output directory and function
+configuration. Every push to `main` then redeploys.
+
+Optionally seed the demo account against the deployed database:
+
+```bash
+DATABASE_URL='<the connection string from Neon>' npm run seed
+```
+
+### Verifying the deployment
+
+`scripts/smoke.mjs` takes a base URL, so the same 54 checks can be run against the live site:
+
+```bash
+SMOKE_BASE=https://your-deployment.vercel.app node scripts/smoke.mjs
+```
+
+### What differs in production
+
+- Cookies gain the `Secure` flag, because `NODE_ENV=production`.
+- `WEB_ORIGIN` defaults to the deployment URL, so CORS needs no configuration. The client and API
+  are same-origin anyway.
+- Rate-limit counters live in each warm instance's memory rather than being shared across them.
+  Account lockout is unaffected — it is stored in Postgres.
+
+---
+
 ## Configuration
 
 `server/.env` — see `server/.env.example`.
@@ -348,7 +417,8 @@ appears nowhere in it.
 | `NODE_ENV` | `development` | `production` enables `Secure` cookies and hides error details |
 | `PORT` | `4000` | |
 | `WEB_ORIGIN` | `http://localhost:5173` | CORS allowlist |
-| `DATABASE_FILE` | `./data/auth.sqlite` | Created with its parent directory |
+| `DATABASE_FILE` | `./data/auth-pg` | Where PGlite stores data when `DATABASE_URL` is unset |
+| `DATABASE_URL` | — | A Postgres connection string. Set it and the app uses that server instead of PGlite. Vercel injects it automatically when a Neon store is attached. |
 | `JWT_SECRET` | — | **Required in production**, minimum 32 characters |
 | `JWT_ISSUER` | `secure-user-auth` | Verified on every token |
 | `JWT_AUDIENCE` | `secure-user-auth.web` | Verified on every token |
@@ -373,8 +443,8 @@ than one that says nothing:
 - **No OAuth or social sign-in.**
 - **HTTPS is assumed to terminate upstream.** `Secure` cookies and `trust proxy` are set for
   production, but the app itself serves plain HTTP.
-- **SQLite, not a clustered database.** Correct for a single-node reference implementation; the
-  session and audit tables would need a real database to scale horizontally.
+- **No connection pooler in front of Postgres.** Fine at this scale, and Neon's pooled
+  connection string handles it; a busy deployment would want PgBouncer.
 
 ---
 

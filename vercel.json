@@ -3,6 +3,12 @@
   "buildCommand": "npm run build",
   "outputDirectory": "web/dist",
   "framework": null,
+  "functions": {
+    "api/**/*.ts": {
+      "maxDuration": 30,
+      "includeFiles": "{server/dist/**,node_modules/@node-rs/argon2-linux-x64-gnu/**}"
+    }
+  },
   "rewrites": [
     {
       "source": "/((?!api/).*)",

@@ -35,7 +35,7 @@ Protected routes
   PASS  GET  /me             invalid token                   401                401
   PASS       error code                                      TOKEN_INVALID      TOKEN_INVALID
   PASS  GET  /me             valid token                     200                200
-  PASS       returns the caller                              smoke-mtpmr8a6@example.com smoke-mtpmr8a6@example.com
+  PASS       returns the caller                              smoke-mtpwrhk6@example.com smoke-mtpwrhk6@example.com
   PASS       omits password material                         false              false
   PASS  GET  /vault          no token                        401                401
   PASS  GET  /vault          valid token                     200                200

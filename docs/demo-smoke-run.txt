@@ -1,0 +1,83 @@
+
+Smoke test against http://localhost:4000/api/v1
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Service
+  PASS  GET  /api/health                                     200                200
+
+CSRF
+  PASS  GET  /auth/csrf                                      200                200
+  PASS       csrf_token cookie set                           true               true
+
+Input validation and error codes
+  PASS  POST /auth/register  missing fields                  400                400
+  PASS       error code                                      VALIDATION_FAILED  VALIDATION_FAILED
+  PASS       names the offending field                       true               true
+  PASS  POST /auth/register  weak password                   400                400
+  PASS       error code                                      WEAK_PASSWORD      WEAK_PASSWORD
+  PASS  POST /auth/register  invalid email                   400                400
+  PASS  POST /auth/register  malformed JSON                  400                400
+  PASS       error code                                      MALFORMED_JSON     MALFORMED_JSON
+  PASS  GET  /does-not-exist                                 404                404
+  PASS       error code                                      ROUTE_NOT_FOUND    ROUTE_NOT_FOUND
+
+Registration
+  PASS  POST /auth/register  valid                           201                201
+  PASS       returns an access token                         true               true
+  PASS       leaks no password material                      false              false
+  PASS       never echoes the plaintext                      false              false
+  PASS       refresh cookie set                              true               true
+  PASS  POST /auth/register  duplicate email                 409                409
+  PASS       error code                                      EMAIL_TAKEN        EMAIL_TAKEN
+
+Protected routes
+  PASS  GET  /me             no token                        401                401
+  PASS  GET  /me             invalid token                   401                401
+  PASS       error code                                      TOKEN_INVALID      TOKEN_INVALID
+  PASS  GET  /me             valid token                     200                200
+  PASS       returns the caller                              smoke-mtpmr8a6@example.com smoke-mtpmr8a6@example.com
+  PASS       omits password material                         false              false
+  PASS  GET  /vault          no token                        401                401
+  PASS  GET  /vault          valid token                     200                200
+  PASS  GET  /me/sessions                                    200                200
+  PASS  GET  /me/activity                                    200                200
+  PASS  POST /vault          create                          201                201
+  PASS       returns the public item shape                   true               true
+
+Forged tokens
+  PASS  GET  /me             alg:none forgery                401                401
+  PASS       error code                                      TOKEN_INVALID      TOKEN_INVALID
+  PASS  GET  /me             HS256 wrong key                 401                401
+  PASS       error code                                      TOKEN_INVALID      TOKEN_INVALID
+
+CSRF enforcement
+  PASS  POST /vault          without CSRF header             403                403
+  PASS       error code                                      CSRF_FAILED        CSRF_FAILED
+
+Refresh rotation and reuse detection
+  PASS  POST /auth/refresh   rotate                          200                200
+  PASS       token actually changed                          true               true
+  PASS  POST /auth/refresh   replay the old token            401                401
+  PASS       error code                                      SESSION_REVOKED    SESSION_REVOKED
+  PASS  POST /auth/refresh   whole family revoked            401                401
+
+Login, and no account enumeration
+  PASS  POST /auth/login     valid                           200                200
+  PASS  POST /auth/login     wrong password                  401                401
+  PASS  POST /auth/login     unknown email                   401                401
+  PASS       identical response body                         true               true
+
+Revocation cuts off live access tokens
+  PASS  GET  /me             before logout-all               200                200
+  PASS  POST /auth/logout-all                                204                204
+  PASS  GET  /me             after logout-all                401                401
+  PASS       error code                                      SESSION_INVALID    SESSION_INVALID
+
+Account lockout
+  PASS  POST /auth/login     after 5 failures                423                423
+  PASS       error code                                      ACCOUNT_LOCKED     ACCOUNT_LOCKED
+  PASS       tells the caller when to retry                  true               true
+
+────────────────────────────────────────────────────────────────────────────────────────────
+All 54 checks passed.
+

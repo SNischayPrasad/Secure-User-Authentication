@@ -1,0 +1,79 @@
+/*
+ * Design tokens — direction: "Credential".
+ *
+ * The product issues identity, so the visual world is security documents: passports,
+ * engraved certificates, banknotes. Intaglio ink ground, hairline guilloche linework,
+ * a foil seal, and a machine-readable zone. Precise and quiet; the boldness is spent
+ * in exactly one place — the credential card on the landing page and dashboard.
+ */
+
+:root {
+  /* Ink — intaglio navy. Deliberately not neutral black: printed security ink is blue-biased. */
+  --ink-900: #050b18;
+  --ink-850: #061020;
+  --ink-800: #081226;
+  --ink-700: #0c1b34;
+  --ink-600: #12294b;
+
+  /* Engraved hairlines */
+  --rule: #1b3a6b;
+  --rule-soft: #132a4e;
+  --rule-faint: #0e1f3a;
+
+  /* Security paper */
+  --paper: #f2f0e7;
+  --paper-dim: #c9ccc4;
+  --paper-mute: #8a9099;
+
+  /* Foil — identity and brand. Rationed: the seal, focus rings, one primary action per view. */
+  --foil: #d8b25c;
+  --foil-bright: #f0d08a;
+  --foil-deep: #8a6a22;
+
+  /* Semantic signals. Each has exactly one job. */
+  --verified: #5fd6ba; /* UV-reactive mint: authenticated, success, active session */
+  --void: #e2574a; /* VOID pantograph red: error, revoked, denied */
+  --pending: #7fa8e8; /* in flight, informational */
+
+  /* Type */
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Public Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Martian Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.875rem;
+  --fs-base: 1rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.5rem;
+  --fs-2xl: clamp(1.75rem, 1.2rem + 2.2vw, 2.5rem);
+  --fs-3xl: clamp(2.25rem, 1.1rem + 5vw, 4rem);
+
+  /* Documents are cut and creased, not rounded. */
+  --radius: 3px;
+  --radius-card: 6px;
+
+  --shell: min(1180px, 100% - 3rem);
+  --shell-narrow: min(30rem, 100% - 2.5rem);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4.5rem;
+  --space-9: 7rem;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --dur: 180ms;
+
+  --shadow-card: 0 1px 0 rgba(242, 240, 231, 0.04), 0 24px 60px -30px rgba(0, 0, 0, 0.9);
+  --shadow-lift: 0 1px 0 rgba(242, 240, 231, 0.06), 0 40px 90px -40px rgba(0, 0, 0, 0.95);
+}
+
+/*
+ * The design is a printed document under inspection light: it commits to one look
+ * rather than swapping palettes. Light-mode users still get the intended artifact,
+ * so the tokens above are the single source of truth.
+ */

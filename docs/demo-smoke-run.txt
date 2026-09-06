@@ -1,5 +1,5 @@
 
-Smoke test against https://secure-user-authentication-server-y.vercel.app/api/v1
+Smoke test against https://secure-user-authentication.vercel.app/api/v1
 ────────────────────────────────────────────────────────────────────────────────────────────
 
 Service
@@ -35,7 +35,7 @@ Protected routes
   PASS  GET  /me             invalid token                   401                401
   PASS       error code                                      TOKEN_INVALID      TOKEN_INVALID
   PASS  GET  /me             valid token                     200                200
-  PASS       returns the caller                              smoke-mtpxvhnh@example.com smoke-mtpxvhnh@example.com
+  PASS       returns the caller                              smoke-mtpylmpa@example.com smoke-mtpylmpa@example.com
   PASS       omits password material                         false              false
   PASS  GET  /vault          no token                        401                401
   PASS  GET  /vault          valid token                     200                200

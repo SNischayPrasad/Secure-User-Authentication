@@ -34,7 +34,7 @@ import {
   type TestApp,
   type UserRow,
 } from "./helpers.js";
-import { db } from "../src/db/index.js";
+import { getDb } from "../src/db/index.js";
 import { ARGON2_OPTIONS, verifyPassword } from "../src/lib/password.js";
 
 let app: TestApp;
@@ -44,27 +44,34 @@ beforeAll(async () => {
 });
 
 // --- direct storage access -------------------------------------------------------------
-// These read the same better-sqlite3 handle the app writes through, so the assertions below
-// are about what is genuinely persisted rather than about what a response happens to omit.
+// These read the same database the app writes through, so the assertions below are about what
+// is genuinely persisted rather than about what a response happens to omit.
 
-function userRow(userId: string): UserRow {
-  const row = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRow | undefined;
+async function userRow(userId: string): Promise<UserRow> {
+  const db = await getDb();
+  const { rows } = await db.query<UserRow>("SELECT * FROM users WHERE id = $1", [userId]);
+  const row = rows[0];
   if (!row) throw new Error(`no users row for ${userId}`);
   return row;
 }
 
-function sessionRow(sessionId: string): SessionRow {
-  const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
-    | SessionRow
-    | undefined;
+async function sessionRow(sessionId: string): Promise<SessionRow> {
+  const db = await getDb();
+  const { rows } = await db.query<SessionRow>("SELECT * FROM sessions WHERE id = $1", [sessionId]);
+  const row = rows[0];
   if (!row) throw new Error(`no sessions row for ${sessionId}`);
   return row;
 }
 
-function familyRows(familyId: string): SessionRow[] {
-  return db
-    .prepare("SELECT * FROM sessions WHERE family_id = ? ORDER BY created_at ASC, rowid ASC")
-    .all(familyId) as SessionRow[];
+async function familyRows(familyId: string): Promise<SessionRow[]> {
+  const db = await getDb();
+  // Ordered by created_at then id. The previous tiebreaker was SQLite's implicit `rowid`, which
+  // Postgres does not have; `id` is unique, so it gives the same deterministic ordering.
+  const { rows } = await db.query<SessionRow>(
+    "SELECT * FROM sessions WHERE family_id = $1 ORDER BY created_at ASC, id ASC",
+    [familyId],
+  );
+  return rows;
 }
 
 describe("password storage", () => {
@@ -72,7 +79,7 @@ describe("password storage", () => {
     const account = await register(request.agent(app));
     expect(account.res.status).toBe(201);
 
-    const row = userRow(account.userId);
+    const row = await userRow(account.userId);
 
     // The encoded PHC string carries algorithm, version and cost parameters inline.
     expect(row.password_hash.startsWith("$argon2id$")).toBe(true);
@@ -108,8 +115,8 @@ describe("password storage", () => {
     expect(first.res.status).toBe(201);
     expect(second.res.status).toBe(201);
 
-    const a = userRow(first.userId);
-    const b = userRow(second.userId);
+    const a = await userRow(first.userId);
+    const b = await userRow(second.userId);
 
     expect(a.password_hash).not.toBe(b.password_hash);
     // Same cost parameters, different salt segment — that difference is the salt doing its job.
@@ -128,7 +135,7 @@ describe("refresh-token rotation and reuse detection", () => {
 
     const csrf = await csrfToken(agent);
     const originalSessionId = decodeJwtPayload(account.accessToken).sid;
-    const familyId = sessionRow(originalSessionId).family_id;
+    const familyId = (await sessionRow(originalSessionId)).family_id;
 
     // --- 1. a legitimate refresh rotates the cookie -------------------------------------
     const rotated = await agent.post("/api/v1/auth/refresh").set("X-CSRF-Token", csrf);
@@ -143,11 +150,11 @@ describe("refresh-token rotation and reuse detection", () => {
     expect(rotatedSessionId).not.toBe(originalSessionId);
 
     // The predecessor is closed and points at its successor; both live in the same family.
-    const predecessor = sessionRow(originalSessionId);
+    const predecessor = await sessionRow(originalSessionId);
     expect(predecessor.revoked_at).not.toBeNull();
     expect(predecessor.revoked_reason).toBe("rotated");
     expect(predecessor.replaced_by).toBe(rotatedSessionId);
-    expect(sessionRow(rotatedSessionId).family_id).toBe(familyId);
+    expect((await sessionRow(rotatedSessionId)).family_id).toBe(familyId);
 
     const liveBefore = await request(app).get("/api/v1/me").set(bearer(rotatedAccessToken));
     expect(liveBefore.status).toBe(200);
@@ -175,7 +182,7 @@ describe("refresh-token rotation and reuse detection", () => {
     expect(liveAfter.status).toBe(401);
     expect(errorCode(liveAfter)).toBe("SESSION_INVALID");
 
-    const family = familyRows(familyId);
+    const family = await familyRows(familyId);
     expect(family).toHaveLength(2);
     expect(family.every((session) => session.revoked_at !== null)).toBe(true);
     expect(family.map((session) => session.revoked_reason)).toEqual(["rotated", "reuse_detected"]);
@@ -204,8 +211,8 @@ describe("POST /api/v1/auth/logout-all", () => {
     expect(errorCode(after)).toBe("SESSION_INVALID");
 
     const sessionId = decodeJwtPayload(account.accessToken).sid;
-    expect(sessionRow(sessionId).revoked_at).not.toBeNull();
-    expect(sessionRow(sessionId).revoked_reason).toBe("logout_all");
+    expect((await sessionRow(sessionId)).revoked_at).not.toBeNull();
+    expect((await sessionRow(sessionId)).revoked_reason).toBe("logout_all");
 
     // The refresh cookie captured before the logout is dead too.
     const replay = await request(app)
@@ -228,7 +235,7 @@ describe("POST /api/v1/auth/logout-all", () => {
     // A cross-site POST must not be able to sign anyone out.
     const still = await request(app).get("/api/v1/me").set(bearer(account.accessToken));
     expect(still.status).toBe(200);
-    expect(sessionRow(decodeJwtPayload(account.accessToken).sid).revoked_at).toBeNull();
+    expect((await sessionRow(decodeJwtPayload(account.accessToken).sid)).revoked_at).toBeNull();
   });
 });
 
@@ -260,11 +267,11 @@ describe("POST /api/v1/me/password", () => {
     const otherAfter = await request(app).get("/api/v1/me").set(bearer(other.accessToken));
     expect(otherAfter.status).toBe(401);
     expect(errorCode(otherAfter)).toBe("SESSION_INVALID");
-    expect(sessionRow(otherSessionId).revoked_at).not.toBeNull();
-    expect(sessionRow(otherSessionId).revoked_reason).toBe("password_changed");
+    expect((await sessionRow(otherSessionId)).revoked_at).not.toBeNull();
+    expect((await sessionRow(otherSessionId)).revoked_reason).toBe("password_changed");
 
     // The caller's own session row is deliberately spared.
-    expect(sessionRow(currentSessionId).revoked_at).toBeNull();
+    expect((await sessionRow(currentSessionId)).revoked_at).toBeNull();
 
     // And it still works end to end: it can rotate, and the token that rotation mints is
     // accepted. (The pre-change access token is deliberately not asserted on — `iat` is
@@ -313,10 +320,10 @@ describe("POST /api/v1/me/password", () => {
     expect(errorCode(res)).toBe("INVALID_CREDENTIALS");
 
     // A stolen access token alone must not be enough to take over the account.
-    const stored = userRow(account.userId);
+    const stored = await userRow(account.userId);
     await expect(verifyPassword(stored.password_hash, VALID_PASSWORD)).resolves.toBe(true);
     await expect(verifyPassword(stored.password_hash, NEW_PASSWORD)).resolves.toBe(false);
-    expect(sessionRow(otherSessionId).revoked_at).toBeNull();
+    expect((await sessionRow(otherSessionId)).revoked_at).toBeNull();
 
     const otherStillWorks = await request(app).get("/api/v1/me").set(bearer(other.accessToken));
     expect(otherStillWorks.status).toBe(200);
@@ -351,7 +358,7 @@ describe("account lockout", () => {
     expect(locked.res.body.accessToken).toBeUndefined();
     expect(getCookie(locked.res, "refresh_token")).toBeUndefined();
 
-    const row = userRow(created.userId);
+    const row = await userRow(created.userId);
     expect(row.failed_attempts).toBe(5);
     expect(row.locked_until).not.toBeNull();
     expect(row.locked_until as number).toBeGreaterThan(Date.now());

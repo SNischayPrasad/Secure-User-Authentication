@@ -1,11 +1,14 @@
-import type Database from "better-sqlite3";
-import { db } from "../db/index.js";
+import { getDb, isUniqueViolation } from "../db/index.js";
 import { newId } from "../lib/crypto.js";
 import { AppError } from "../lib/errors.js";
 
 /**
  * User data access. Every read returns the raw row (which carries `password_hash`); only
  * `toPublicUser` is allowed to cross the wire, so a password hash can never leak into a response.
+ *
+ * Writes use `RETURNING *` rather than an update followed by a select. On a serverless
+ * deployment every extra statement is another network round trip to the database, and the
+ * two-statement form is also racy: another request could change the row in between.
  */
 
 /** A `users` row exactly as stored. Contains `password_hash` — never serialise this directly. */
@@ -40,36 +43,18 @@ export const MAX_FAILED_ATTEMPTS = 5;
 /** How long an account stays locked once the failure threshold is hit (15 minutes). */
 export const LOCK_WINDOW_MS = 15 * 60_000;
 
-const statements = new Map<string, Database.Statement<unknown[], unknown>>();
-
-/**
- * Lazily prepares and caches a statement. Lazy because module import happens before
- * `migrate()` runs, so preparing at import time would fail with "no such table".
- */
-function stmt<R = unknown>(sql: string): Database.Statement<unknown[], R> {
-  const cached = statements.get(sql);
-  if (cached) return cached as Database.Statement<unknown[], R>;
-  const prepared = db.prepare<unknown[], R>(sql);
-  statements.set(sql, prepared as Database.Statement<unknown[], unknown>);
-  return prepared;
-}
-
 const SELECT_COLUMNS = `id, email, email_canonical, name, password_hash, password_algo, role,
   failed_attempts, locked_until, password_changed_at, created_at, updated_at`;
-
-/** True when better-sqlite3 rejected a write because of a UNIQUE index (here: the email columns). */
-function isUniqueViolation(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const code = (err as { code?: unknown }).code;
-  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
-}
 
 /** Trims and lowercases an address so one human identity maps to exactly one stored account. */
 export function normaliseEmail(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
-/** Strips every password and lockout field from a row; the whitelist is explicit (never a spread) so a new column can't silently leak. */
+/**
+ * Strips every password and lockout field from a row. The whitelist is explicit — never a
+ * spread — so adding a column to the table cannot silently start leaking it.
+ */
 export function toPublicUser(row: UserRecord): PublicUser {
   return {
     id: row.id,
@@ -81,52 +66,74 @@ export function toPublicUser(row: UserRecord): PublicUser {
   };
 }
 
-/** Looks a user up by canonical email; callers must still return a generic error so this cannot be used to enumerate accounts. */
-export function findByEmail(email: string): UserRecord | undefined {
-  return stmt<UserRecord>(
-    `SELECT ${SELECT_COLUMNS} FROM users WHERE email_canonical = ?`,
-  ).get(normaliseEmail(email));
+/**
+ * Looks a user up by canonical email. Callers must still return a generic error either way, so
+ * this cannot be used to enumerate accounts.
+ */
+export async function findByEmail(email: string): Promise<UserRecord | undefined> {
+  const db = await getDb();
+  const { rows } = await db.query<UserRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM users WHERE email_canonical = $1`,
+    [normaliseEmail(email)],
+  );
+  return rows[0];
 }
 
 /** Loads a user by id, or `undefined` if the account has since been deleted. */
-export function findById(id: string): UserRecord | undefined {
-  return stmt<UserRecord>(`SELECT ${SELECT_COLUMNS} FROM users WHERE id = ?`).get(id);
+export async function findById(id: string): Promise<UserRecord | undefined> {
+  const db = await getDb();
+  const { rows } = await db.query<UserRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM users WHERE id = $1`,
+    [id],
+  );
+  return rows[0];
 }
 
 /**
  * Inserts a new user and returns the stored row.
- * Uniqueness is enforced by the database and the constraint error is translated here, rather than
- * doing a check-then-insert, so two simultaneous registrations cannot both win the race.
+ *
+ * Uniqueness is enforced by the database and the constraint error is translated here, rather
+ * than doing a check-then-insert, so two simultaneous registrations of the same address cannot
+ * both win the race.
  */
-export function createUser(input: { name: string; email: string; passwordHash: string }): UserRecord {
+export async function createUser(input: {
+  name: string;
+  email: string;
+  passwordHash: string;
+}): Promise<UserRecord> {
+  const db = await getDb();
   const now = Date.now();
   const id = newId("usr");
   const canonical = normaliseEmail(input.email);
 
   try {
-    stmt(
+    const { rows } = await db.query<UserRecord>(
       `INSERT INTO users (
          id, email, email_canonical, name, password_hash, password_algo, role,
          failed_attempts, locked_until, password_changed_at, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, 'argon2id', 'user', 0, NULL, ?, ?, ?)`,
-    ).run(id, canonical, canonical, input.name.trim(), input.passwordHash, now, now, now);
+       ) VALUES ($1, $2, $3, $4, $5, 'argon2id', 'user', 0, NULL, $6, $7, $8)
+       RETURNING ${SELECT_COLUMNS}`,
+      [id, canonical, canonical, input.name.trim(), input.passwordHash, now, now, now],
+    );
+    const row = rows[0];
+    if (!row) throw new AppError(500, "INTERNAL_ERROR", "The account could not be created.");
+    return row;
   } catch (err) {
     if (isUniqueViolation(err)) {
       throw new AppError(409, "EMAIL_TAKEN", "That email address is already registered.");
     }
     throw err;
   }
-
-  const row = findById(id);
-  if (!row) throw new AppError(500, "INTERNAL_ERROR", "The account could not be created.");
-  return row;
 }
 
 /** Updates the display name and returns the fresh row. */
-export function updateName(id: string, name: string): UserRecord {
-  const now = Date.now();
-  stmt(`UPDATE users SET name = ?, updated_at = ? WHERE id = ?`).run(name.trim(), now, id);
-  const row = findById(id);
+export async function updateName(id: string, name: string): Promise<UserRecord> {
+  const db = await getDb();
+  const { rows } = await db.query<UserRecord>(
+    `UPDATE users SET name = $1, updated_at = $2 WHERE id = $3 RETURNING ${SELECT_COLUMNS}`,
+    [name.trim(), Date.now(), id],
+  );
+  const row = rows[0];
   if (!row) throw new AppError(404, "NOT_FOUND", "That account no longer exists.");
   return row;
 }
@@ -135,14 +142,17 @@ export function updateName(id: string, name: string): UserRecord {
  * Stores a new password hash and stamps `password_changed_at`, which is what invalidates access
  * tokens minted before the change (authenticate compares `iat` against it).
  */
-export function updatePassword(id: string, passwordHash: string): UserRecord {
+export async function updatePassword(id: string, passwordHash: string): Promise<UserRecord> {
+  const db = await getDb();
   const now = Date.now();
-  stmt(
+  const { rows } = await db.query<UserRecord>(
     `UPDATE users
-        SET password_hash = ?, password_algo = 'argon2id', password_changed_at = ?, updated_at = ?
-      WHERE id = ?`,
-  ).run(passwordHash, now, now, id);
-  const row = findById(id);
+        SET password_hash = $1, password_algo = 'argon2id', password_changed_at = $2, updated_at = $3
+      WHERE id = $4
+      RETURNING ${SELECT_COLUMNS}`,
+    [passwordHash, now, now, id],
+  );
+  const row = rows[0];
   if (!row) throw new AppError(404, "NOT_FOUND", "That account no longer exists.");
   return row;
 }
@@ -150,38 +160,56 @@ export function updatePassword(id: string, passwordHash: string): UserRecord {
 /**
  * Counts one failed sign-in and locks the account for 15 minutes once the threshold is reached,
  * which caps online password guessing to a handful of tries per window.
+ *
+ * The increment happens in a single statement rather than read-then-write, so concurrent failed
+ * attempts cannot both read the same counter and lose one of the increments.
  */
-export function registerFailedLogin(id: string): { attempts: number; lockedUntil: number | null } {
+export async function registerFailedLogin(
+  id: string,
+): Promise<{ attempts: number; lockedUntil: number | null }> {
+  const db = await getDb();
   const now = Date.now();
-  const run = db.transaction((userId: string): { attempts: number; lockedUntil: number | null } => {
-    const row = findById(userId);
-    if (!row) return { attempts: 0, lockedUntil: null };
+  const lockUntil = now + LOCK_WINDOW_MS;
 
-    const attempts = row.failed_attempts + 1;
-    const existingLock = row.locked_until !== null && row.locked_until > now ? row.locked_until : null;
-    const lockedUntil = attempts >= MAX_FAILED_ATTEMPTS ? now + LOCK_WINDOW_MS : existingLock;
+  const { rows } = await db.query<{ failed_attempts: number; locked_until: number | null }>(
+    `UPDATE users
+        SET failed_attempts = failed_attempts + 1,
+            locked_until = CASE
+              WHEN failed_attempts + 1 >= $1 THEN $2
+              WHEN locked_until IS NOT NULL AND locked_until > $3 THEN locked_until
+              ELSE NULL
+            END,
+            updated_at = $3
+      WHERE id = $4
+      RETURNING failed_attempts, locked_until`,
+    [MAX_FAILED_ATTEMPTS, lockUntil, now, id],
+  );
 
-    stmt(
-      `UPDATE users SET failed_attempts = ?, locked_until = ?, updated_at = ? WHERE id = ?`,
-    ).run(attempts, lockedUntil, now, userId);
-
-    return { attempts, lockedUntil };
-  });
-  return run(id);
+  const row = rows[0];
+  if (!row) return { attempts: 0, lockedUntil: null };
+  return { attempts: row.failed_attempts, lockedUntil: row.locked_until };
 }
 
 /** Resets the failure counter and any lock after a successful sign-in. */
-export function clearLoginFailures(id: string): void {
-  stmt(
-    `UPDATE users SET failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE id = ?`,
-  ).run(Date.now(), id);
+export async function clearLoginFailures(id: string): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE users SET failed_attempts = 0, locked_until = NULL, updated_at = $1 WHERE id = $2`,
+    [Date.now(), id],
+  );
 }
 
-/** Reports whether the account is currently locked, with the seconds left so the route can answer 423 with `retryAfterSeconds`. */
+/**
+ * Reports whether the account is currently locked, with the seconds left so the route can answer
+ * 423 with `retryAfterSeconds`. Pure computation over a row already in hand — no query.
+ */
 export function isLocked(row: UserRecord): { locked: boolean; retryAfterSeconds: number } {
   const now = Date.now();
   if (row.locked_until !== null && row.locked_until > now) {
-    return { locked: true, retryAfterSeconds: Math.max(1, Math.ceil((row.locked_until - now) / 1000)) };
+    return {
+      locked: true,
+      retryAfterSeconds: Math.max(1, Math.ceil((row.locked_until - now) / 1000)),
+    };
   }
   return { locked: false, retryAfterSeconds: 0 };
 }

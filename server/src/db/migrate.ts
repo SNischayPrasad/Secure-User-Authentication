@@ -1,20 +1,21 @@
-import { db } from "./index.js";
+import { getDb } from "./index.js";
 
 /**
- * The authoritative schema DDL, embedded as a string on purpose.
+ * The authoritative DDL.
  *
- * `tsc` compiles the TypeScript sources into `dist/` and does NOT copy `.sql` files, so
- * reading `db/schema.sql` from disk at runtime would work under `tsx` in
- * development and then crash a production `node dist/index.js` boot. Keeping the
- * DDL in the module means the compiled output is self-contained.
+ * It lives here as a string rather than being read from schema.sql at runtime, because `tsc`
+ * compiles src/**\/*.ts into dist/ without copying .sql assets — a `readFileSync` would work
+ * under tsx in development and then fail on a production boot. `server/src/db/schema.sql` is
+ * kept byte-for-byte identical purely as readable documentation.
  *
- * `db/schema.sql` holds an identical copy purely as human-readable documentation —
- * change both in the same commit.
+ * Every statement is idempotent, so migrate() can run on every boot without a version table.
+ * That matters more on Vercel than it did locally: any cold-started instance may be the first
+ * one to touch a fresh database.
  *
- * Every statement is `IF NOT EXISTS`, so applying it repeatedly is a no-op.
+ * All timestamps are BIGINT epoch milliseconds. BIGINT rather than INTEGER is not cosmetic —
+ * Date.now() is about 1.79e12, which overflows Postgres INTEGER at 2.15e9.
  */
 export const SCHEMA_SQL = `
--- users --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
   id                  TEXT    PRIMARY KEY,
   email               TEXT    NOT NULL UNIQUE,
@@ -25,53 +26,48 @@ CREATE TABLE IF NOT EXISTS users (
   role                TEXT    NOT NULL DEFAULT 'user'
                               CHECK (role IN ('user', 'admin')),
   failed_attempts     INTEGER NOT NULL DEFAULT 0,
-  locked_until        INTEGER,
-  password_changed_at INTEGER NOT NULL,
-  created_at          INTEGER NOT NULL,
-  updated_at          INTEGER NOT NULL
+  locked_until        BIGINT,
+  password_changed_at BIGINT  NOT NULL,
+  created_at          BIGINT  NOT NULL,
+  updated_at          BIGINT  NOT NULL
 );
 
--- sessions (one row per refresh-token family member) ------------------------
 CREATE TABLE IF NOT EXISTS sessions (
-  id             TEXT    PRIMARY KEY,
-  user_id        TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  family_id      TEXT    NOT NULL,
-  token_hash     TEXT    NOT NULL UNIQUE,
+  id             TEXT   PRIMARY KEY,
+  user_id        TEXT   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  family_id      TEXT   NOT NULL,
+  token_hash     TEXT   NOT NULL UNIQUE,
   user_agent     TEXT,
   ip_address     TEXT,
-  created_at     INTEGER NOT NULL,
-  last_used_at   INTEGER NOT NULL,
-  expires_at     INTEGER NOT NULL,
-  revoked_at     INTEGER,
+  created_at     BIGINT NOT NULL,
+  last_used_at   BIGINT NOT NULL,
+  expires_at     BIGINT NOT NULL,
+  revoked_at     BIGINT,
   revoked_reason TEXT,
   replaced_by    TEXT
 );
 
--- auth_events (append-only audit log; no FK so it outlives the user row) ----
 CREATE TABLE IF NOT EXISTS auth_events (
-  id              TEXT    PRIMARY KEY,
+  id              TEXT   PRIMARY KEY,
   user_id         TEXT,
   email_attempted TEXT,
-  type            TEXT    NOT NULL,
-  outcome         TEXT    NOT NULL
-                          CHECK (outcome IN ('success', 'failure')),
+  type            TEXT   NOT NULL,
+  outcome         TEXT   NOT NULL CHECK (outcome IN ('success', 'failure')),
   detail          TEXT,
   ip_address      TEXT,
   user_agent      TEXT,
-  created_at      INTEGER NOT NULL
+  created_at      BIGINT NOT NULL
 );
 
--- vault_items (the protected resource) -------------------------------------
 CREATE TABLE IF NOT EXISTS vault_items (
-  id         TEXT    PRIMARY KEY,
-  user_id    TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title      TEXT    NOT NULL,
-  body       TEXT    NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  id         TEXT   PRIMARY KEY,
+  user_id    TEXT   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title      TEXT   NOT NULL,
+  body       TEXT   NOT NULL,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
 );
 
--- indexes -------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id
   ON sessions (user_id);
 
@@ -88,14 +84,26 @@ CREATE INDEX IF NOT EXISTS idx_vault_items_user_id_updated_at
   ON vault_items (user_id, updated_at DESC);
 `;
 
+let applied: Promise<void> | null = null;
+
 /**
- * Applies the schema. Idempotent, and wrapped in a transaction so a half-created
- * schema can never be left behind if one statement fails. Call once at boot,
- * before the server accepts any request.
+ * Applies the schema exactly once per process.
+ *
+ * The cached promise matters on serverless: several requests can hit a cold instance at once,
+ * and without it each would run the DDL concurrently. `CREATE TABLE IF NOT EXISTS` is not
+ * immune to that — two concurrent creations of the same table race in Postgres and one raises
+ * a duplicate-object error.
  */
-export function migrate(): void {
-  const apply = db.transaction((): void => {
-    db.exec(SCHEMA_SQL);
-  });
-  apply();
+export function migrate(): Promise<void> {
+  if (!applied) {
+    applied = (async () => {
+      const db = await getDb();
+      await db.exec(SCHEMA_SQL);
+    })().catch((error: unknown) => {
+      // Let the next caller retry rather than caching a permanent failure.
+      applied = null;
+      throw error;
+    });
+  }
+  return applied;
 }

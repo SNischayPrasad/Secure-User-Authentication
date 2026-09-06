@@ -88,18 +88,19 @@ export type AccessTokenClaims = {
  */
 export async function makeApp(): Promise<TestApp> {
   const { migrate } = await import("../src/db/migrate.js");
-  migrate();
+  await migrate();
   const { createApp } = await import("../src/app.js");
   return (await createApp()) as TestApp;
 }
 
 /**
- * Returns the live better-sqlite3 handle the app is writing through, so tests can assert on
- * what is actually persisted (e.g. that a plaintext password never reaches a column).
+ * Returns the live database handle the app is writing through, so tests can assert on what is
+ * actually persisted (e.g. that a plaintext password never reaches a column) rather than on
+ * what a response happens to omit.
  */
 export async function getDb() {
   const mod = await import("../src/db/index.js");
-  return mod.db;
+  return mod.getDb();
 }
 
 /** A fresh lowercase email per call, so each test gets its own account and rate-limit key. */

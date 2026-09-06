@@ -1,52 +1,161 @@
+import pg from "pg";
+import type { PGlite } from "@electric-sql/pglite";
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import Database from "better-sqlite3";
-import { env } from "../config/env.js";
+import { dirname } from "node:path";
+
+import { env, isProd } from "../config/env.js";
 
 /**
- * The literal SQLite filename that means "keep the whole database in RAM".
- * Tests use it so each suite gets a disposable database with no file to clean up.
+ * One database interface, two drivers, one SQL dialect.
+ *
+ * Production (Vercel, Neon) uses node-postgres over a pooled connection string. Local
+ * development and the test suite use PGlite, which is real PostgreSQL compiled to WebAssembly
+ * and run in-process.
+ *
+ * Using Postgres in both places is the whole point: a clone still needs no database server
+ * installed, and the SQL that runs against Neon is byte-for-byte the SQL the tests ran. A
+ * SQLite-locally / Postgres-in-production split would mean the dialect that ships is the one
+ * nothing ever tested.
  */
-const IN_MEMORY = ":memory:";
 
-/**
- * Opens the SQLite database, creating the parent directory first, and applies the
- * connection pragmas. WAL keeps readers from blocking the writer, `foreign_keys = ON`
- * is required for the `ON DELETE CASCADE` that wipes a deleted user's sessions and
- * vault items (SQLite disables FK enforcement by default), and `busy_timeout` makes
- * concurrent writes wait rather than immediately throwing SQLITE_BUSY.
- */
-function openDatabase(): Database.Database {
-  const file = env.databaseFile;
+export type QueryResult<T> = { rows: T[]; rowCount: number };
 
-  if (file !== IN_MEMORY) {
-    // `recursive: true` is a no-op when the directory already exists.
-    mkdirSync(dirname(resolve(file)), { recursive: true });
-  }
-
-  const database = new Database(file);
-
-  // On an in-memory database `journal_mode = WAL` is silently kept as "memory";
-  // it is harmless to request it unconditionally.
-  database.pragma("journal_mode = WAL");
-  database.pragma("foreign_keys = ON");
-  database.pragma("busy_timeout = 5000");
-
-  return database;
+export interface Db {
+  /** Runs a parameterised statement. Placeholders are Postgres-style: $1, $2, … */
+  query<T = Record<string, unknown>>(sql: string, params?: readonly unknown[]): Promise<QueryResult<T>>;
+  /** Runs one or more statements with no parameters. Used by the migration only. */
+  exec(sql: string): Promise<void>;
+  /** Runs `fn` inside a transaction, rolling back if it throws. */
+  transaction<T>(fn: (tx: Db) => Promise<T>): Promise<T>;
 }
 
 /**
- * The single process-wide SQLite connection. better-sqlite3 is synchronous and
- * fully serialised, so one shared connection is both correct and fastest here.
+ * node-postgres returns BIGINT (oid 20) as a string, because a 64-bit integer does not always
+ * fit a JS number. Every BIGINT in this schema is an epoch-millisecond timestamp, which stays
+ * far below Number.MAX_SAFE_INTEGER until the year 287396, so parsing to a number here keeps
+ * the row shapes identical to what PGlite returns. Without this, `createdAt` would arrive as a
+ * string in production and as a number in every test.
  */
-export const db: Database.Database = openDatabase();
+pg.types.setTypeParser(pg.types.builtins.INT8, (value: string) => Number.parseInt(value, 10));
+
+/** True when the error is a Postgres unique-constraint violation, on either driver. */
+export function isUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "23505";
+}
+
+let instance: Promise<Db> | null = null;
+let closer: (() => Promise<void>) | null = null;
+
+function wrapPool(pool: pg.Pool): Db {
+  const asDb = (runner: pg.Pool | pg.PoolClient): Db => ({
+    async query(sql, params) {
+      const result = await runner.query(sql, params as unknown[]);
+      return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length };
+    },
+    async exec(sql) {
+      await runner.query(sql);
+    },
+    async transaction(fn) {
+      // A nested transaction reuses the client it is already inside rather than opening
+      // a second connection, which would deadlock against its own uncommitted rows.
+      if (runner !== pool) return fn(asDb(runner));
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const value = await fn(asDb(client));
+        await client.query("COMMIT");
+        return value;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  });
+
+  return asDb(pool);
+}
+
+function wrapPglite(lite: PGlite): Db {
+  const asDb = (runner: Pick<PGlite, "query" | "exec" | "transaction">): Db => ({
+    async query(sql, params) {
+      const result = await runner.query(sql, params as unknown[]);
+      return { rows: result.rows as never[], rowCount: result.affectedRows ?? result.rows.length };
+    },
+    async exec(sql) {
+      await runner.exec(sql);
+    },
+    async transaction(fn) {
+      if (runner !== lite) return fn(asDb(runner));
+      return lite.transaction(async (tx) =>
+        fn({
+          query: async (sql, params) => {
+            const result = await tx.query(sql, params as unknown[]);
+            return { rows: result.rows as never[], rowCount: result.affectedRows ?? result.rows.length };
+          },
+          exec: async (sql) => {
+            await tx.exec(sql);
+          },
+          transaction: async (nested) => nested(asDb(tx as never)),
+        }),
+      ) as never;
+    },
+  });
+
+  return asDb(lite);
+}
+
+async function connect(): Promise<Db> {
+  if (env.databaseUrl) {
+    const pool = new pg.Pool({
+      connectionString: env.databaseUrl,
+      // Managed Postgres (Neon and friends) terminates plaintext connections. Certificate
+      // verification is left to the driver default for the platform CA.
+      ssl: env.databaseUrl.includes("localhost") ? false : { rejectUnauthorized: false },
+      // Serverless invocations are short and numerous; a small ceiling per instance keeps the
+      // provider's connection limit from being exhausted by concurrent cold starts.
+      max: isProd ? 3 : 10,
+      idleTimeoutMillis: 10_000,
+      connectionTimeoutMillis: 10_000,
+    });
+    closer = () => pool.end();
+    return wrapPool(pool);
+  }
+
+  // No connection string: run Postgres in-process.
+  //
+  // Imported dynamically, not at module scope: PGlite carries a multi-megabyte WebAssembly
+  // build of Postgres, and a static import would pull all of it into the serverless bundle
+  // that never uses it.
+  const { PGlite: Lite } = await import("@electric-sql/pglite");
+
+  const memory = env.databaseFile === ":memory:";
+  if (!memory) mkdirSync(dirname(env.databaseFile), { recursive: true });
+
+  const lite = new Lite(memory ? undefined : env.databaseFile);
+  await lite.waitReady;
+  closer = () => lite.close();
+  return wrapPglite(lite);
+}
 
 /**
- * Closes the connection, flushing the WAL back into the main database file.
- * Idempotent, so shutdown hooks and test teardown can both call it safely.
+ * The shared connection. Cached at module scope so a warm serverless instance reuses its pool
+ * across invocations instead of opening a new one per request.
  */
-export function closeDb(): void {
-  if (db.open) {
-    db.close();
-  }
+export function getDb(): Promise<Db> {
+  if (!instance) instance = connect();
+  return instance;
+}
+
+/** Closes the connection. Used by graceful shutdown and by the seed script. */
+export async function closeDb(): Promise<void> {
+  if (!instance) return;
+  const pending = instance;
+  instance = null;
+  await pending.catch(() => undefined);
+  const close = closer;
+  closer = null;
+  if (close) await close();
 }

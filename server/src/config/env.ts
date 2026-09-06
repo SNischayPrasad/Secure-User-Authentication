@@ -10,6 +10,12 @@ export type AppEnv = {
   port: number;
   webOrigin: string;
   databaseFile: string;
+  /**
+   * A Postgres connection string. When present the app connects to that server; when absent it
+   * runs PGlite (in-process Postgres) against `databaseFile`. Vercel injects this automatically
+   * once a Neon store is attached to the project.
+   */
+  databaseUrl: string | null;
   jwtSecret: string;
   jwtIssuer: string;
   jwtAudience: string;
@@ -21,12 +27,23 @@ export type AppEnv = {
 /** Server package root: `src/config/env.ts` and `dist/config/env.js` both sit two levels down. */
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+/**
+ * On Vercel the client and the API are served from the same deployment, so the allowed origin is
+ * the deployment's own URL. Vercel exposes it without the scheme; the production alias is
+ * preferred over the per-deployment host so preview builds do not pin CORS to a URL that changes
+ * on every push. Returns null anywhere else, leaving the localhost default in place.
+ */
+function vercelOrigin(): string | null {
+  const host = process.env["VERCEL_PROJECT_PRODUCTION_URL"] ?? process.env["VERCEL_URL"];
+  return host ? `https://${host}` : null;
+}
+
 /** Defaults from the build contract, expressed as raw strings so they validate like real input. */
 const DEFAULTS: Record<string, string> = {
   NODE_ENV: "development",
   PORT: "4000",
-  WEB_ORIGIN: "http://localhost:5173",
-  DATABASE_FILE: "./data/auth.sqlite",
+  WEB_ORIGIN: vercelOrigin() ?? "http://localhost:5173",
+  DATABASE_FILE: "./data/auth-pg",
   JWT_ISSUER: "secure-user-auth",
   JWT_AUDIENCE: "secure-user-auth.web",
   ACCESS_TOKEN_TTL: "900",
@@ -118,6 +135,10 @@ const envSchema = z.object({
   PORT: integerEnv("PORT", 1, 65535),
   WEB_ORIGIN: originEnv,
   DATABASE_FILE: z.string().min(1, "DATABASE_FILE must not be empty."),
+  // Vercel's Neon integration sets several aliases; any one of them is accepted.
+  DATABASE_URL: z.string().min(1).optional(),
+  POSTGRES_URL: z.string().min(1).optional(),
+  DATABASE_POSTGRES_URL: z.string().min(1).optional(),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters.").optional(),
   JWT_ISSUER: z.string().min(1, "JWT_ISSUER must not be empty."),
   JWT_AUDIENCE: z.string().min(1, "JWT_AUDIENCE must not be empty."),
@@ -184,6 +205,7 @@ function loadEnv(): AppEnv {
     port: data.PORT,
     webOrigin: data.WEB_ORIGIN,
     databaseFile: data.DATABASE_FILE,
+    databaseUrl: data.DATABASE_URL ?? data.POSTGRES_URL ?? data.DATABASE_POSTGRES_URL ?? null,
     jwtSecret: resolveJwtSecret(data.JWT_SECRET, production),
     jwtIssuer: data.JWT_ISSUER,
     jwtAudience: data.JWT_AUDIENCE,

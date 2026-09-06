@@ -1,7 +1,6 @@
-import type Database from "better-sqlite3";
 import type { Request } from "express";
 import { env } from "../config/env.js";
-import { db } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { AppError } from "../lib/errors.js";
 import { newId, randomToken, sha256 } from "../lib/crypto.js";
 
@@ -39,27 +38,19 @@ import type { SessionRecord } from "../types.js";
 
 const MAX_USER_AGENT_CHARS = 255;
 
-const statements = new Map<string, Database.Statement<unknown[], unknown>>();
-
-/**
- * Lazily prepares and caches a statement. Lazy because module import happens before
- * `migrate()` runs, so preparing at import time would fail with "no such table".
- */
-function stmt<R = unknown>(sql: string): Database.Statement<unknown[], R> {
-  const cached = statements.get(sql);
-  if (cached) return cached as Database.Statement<unknown[], R>;
-  const prepared = db.prepare<unknown[], R>(sql);
-  statements.set(sql, prepared as Database.Statement<unknown[], unknown>);
-  return prepared;
-}
-
 const SELECT_COLUMNS = `id, user_id, family_id, token_hash, user_agent, ip_address,
   created_at, last_used_at, expires_at, revoked_at, revoked_reason, replaced_by`;
 
+/**
+ * The insert hands the stored row straight back with `RETURNING`, so creating a session costs one
+ * round trip instead of an insert followed by a select — and the row returned is unambiguously
+ * the one just written, even if another request touches the table immediately afterwards.
+ */
 const INSERT_SESSION = `INSERT INTO sessions (
     id, user_id, family_id, token_hash, user_agent, ip_address,
     created_at, last_used_at, expires_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+  RETURNING ${SELECT_COLUMNS}`;
 
 /** Client user agent, length-capped so a hostile header cannot bloat the row. */
 function userAgentOf(req?: Request): string | null {
@@ -74,15 +65,20 @@ function ipOf(req?: Request): string | null {
   return raw ? raw.slice(0, 64) : null;
 }
 
-function requireById(id: string): SessionRecord {
-  const row = findById(id);
+/** Guards the row an insert returns: no row back means the session was never stored. */
+function requireStored(row: SessionRecord | undefined): SessionRecord {
   if (!row) throw new AppError(500, "INTERNAL_ERROR", "The session could not be created.");
   return row;
 }
 
 /** Loads a session by id — used by `authenticate` to confirm the `sid` in an access token is still live. */
-export function findById(id: string): SessionRecord | undefined {
-  return stmt<SessionRecord>(`SELECT ${SELECT_COLUMNS} FROM sessions WHERE id = ?`).get(id);
+export async function findById(id: string): Promise<SessionRecord | undefined> {
+  const db = await getDb();
+  const { rows } = await db.query<SessionRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM sessions WHERE id = $1`,
+    [id],
+  );
+  return rows[0];
 }
 
 /**
@@ -90,18 +86,19 @@ export function findById(id: string): SessionRecord | undefined {
  * else; only its sha256 is written, so the stored row cannot be turned back into a credential.
  * Omit `familyId` to start a new rotation family (a fresh login).
  */
-export function createSession(input: {
+export async function createSession(input: {
   userId: string;
   familyId?: string;
   req?: Request;
-}): { session: SessionRecord; refreshToken: string } {
+}): Promise<{ session: SessionRecord; refreshToken: string }> {
+  const db = await getDb();
   const now = Date.now();
   const id = newId("ses");
   const familyId = input.familyId ?? newId("fam");
   const refreshToken = randomToken(32);
   const expiresAt = now + env.refreshTokenTtlSeconds * 1000;
 
-  stmt(INSERT_SESSION).run(
+  const { rows } = await db.query<SessionRecord>(INSERT_SESSION, [
     id,
     input.userId,
     familyId,
@@ -111,9 +108,9 @@ export function createSession(input: {
     now,
     now,
     expiresAt,
-  );
+  ]);
 
-  return { session: requireById(id), refreshToken };
+  return { session: requireStored(rows[0]), refreshToken };
 }
 
 /**
@@ -121,11 +118,14 @@ export function createSession(input: {
  * Revoked and expired rows are returned deliberately: the refresh route must be able to tell
  * "unknown token" from "already-rotated token" to detect reuse.
  */
-export function findByToken(rawToken: string): SessionRecord | undefined {
+export async function findByToken(rawToken: string): Promise<SessionRecord | undefined> {
   if (!rawToken) return undefined;
-  return stmt<SessionRecord>(
-    `SELECT ${SELECT_COLUMNS} FROM sessions WHERE token_hash = ?`,
-  ).get(sha256(rawToken));
+  const db = await getDb();
+  const { rows } = await db.query<SessionRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM sessions WHERE token_hash = $1`,
+    [sha256(rawToken)],
+  );
+  return rows[0];
 }
 
 /**
@@ -133,27 +133,32 @@ export function findByToken(rawToken: string): SessionRecord | undefined {
  * reason `rotated`, both in one transaction so a crash can never leave two live tokens in a family.
  * Throws 401 `SESSION_INVALID` if the row was concurrently revoked, which rolls the successor back.
  */
-export function rotate(
+export async function rotate(
   current: SessionRecord,
   req?: Request,
-): { session: SessionRecord; refreshToken: string } {
+): Promise<{ session: SessionRecord; refreshToken: string }> {
+  const db = await getDb();
   const now = Date.now();
   const nextId = newId("ses");
   const refreshToken = randomToken(32);
   const expiresAt = now + env.refreshTokenTtlSeconds * 1000;
 
-  const run = db.transaction((): void => {
-    const revoked = stmt(
+  const session = await db.transaction(async (tx) => {
+    const revoked = await tx.query(
       `UPDATE sessions
-          SET revoked_at = ?, revoked_reason = 'rotated', replaced_by = ?, last_used_at = ?
-        WHERE id = ? AND revoked_at IS NULL`,
-    ).run(now, nextId, now, current.id);
+          SET revoked_at = $1, revoked_reason = 'rotated', replaced_by = $2, last_used_at = $3
+        WHERE id = $4 AND revoked_at IS NULL`,
+      [now, nextId, now, current.id],
+    );
 
-    if (revoked.changes === 0) {
+    // Retiring the predecessor is what decides the race: `revoked_at IS NULL` lets exactly one of
+    // two concurrent refreshes match the row, so the loser updates nothing, is rejected here, and
+    // never walks away with a second live token in the family.
+    if (revoked.rowCount === 0) {
       throw new AppError(401, "SESSION_INVALID", "Your session has ended. Sign in again.");
     }
 
-    stmt(INSERT_SESSION).run(
+    const { rows } = await tx.query<SessionRecord>(INSERT_SESSION, [
       nextId,
       current.user_id,
       current.family_id,
@@ -163,11 +168,12 @@ export function rotate(
       now,
       now,
       expiresAt,
-    );
-  });
-  run();
+    ]);
 
-  return { session: requireById(nextId), refreshToken };
+    return requireStored(rows[0]);
+  });
+
+  return { session, refreshToken };
 }
 
 /**
@@ -175,44 +181,60 @@ export function rotate(
  * This is the reuse-detection hammer: one replayed token invalidates the whole chain.
  * Already-revoked rows keep their original reason so the audit trail stays truthful.
  */
-export function revokeFamily(familyId: string, reason: string): number {
-  const info = stmt(
+export async function revokeFamily(familyId: string, reason: string): Promise<number> {
+  const db = await getDb();
+  const info = await db.query(
     `UPDATE sessions
-        SET revoked_at = ?, revoked_reason = ?
-      WHERE family_id = ? AND revoked_at IS NULL`,
-  ).run(Date.now(), reason, familyId);
-  return info.changes;
+        SET revoked_at = $1, revoked_reason = $2
+      WHERE family_id = $3 AND revoked_at IS NULL`,
+    [Date.now(), reason, familyId],
+  );
+  return info.rowCount;
 }
 
 /** Revokes a single session; already-revoked rows are left untouched so the first reason survives. */
-export function revokeSession(id: string, reason: string): void {
-  stmt(
-    `UPDATE sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ? AND revoked_at IS NULL`,
-  ).run(Date.now(), reason, id);
+export async function revokeSession(id: string, reason: string): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE sessions SET revoked_at = $1, revoked_reason = $2 WHERE id = $3 AND revoked_at IS NULL`,
+    [Date.now(), reason, id],
+  );
 }
 
 /**
  * Revokes all of a user's live sessions and returns the count. `exceptSessionId` keeps one alive,
  * which is how a password change signs out every other device without signing out the one in use.
  */
-export function revokeAllForUser(userId: string, reason: string, exceptSessionId?: string): number {
+export async function revokeAllForUser(
+  userId: string,
+  reason: string,
+  exceptSessionId?: string,
+): Promise<number> {
+  const db = await getDb();
   const keep = exceptSessionId ?? null;
-  const info = stmt(
+  // `$4` carries the "keep this one" id and is cast explicitly: a placeholder that appears only
+  // inside `IS NULL` gives Postgres nothing to infer a type from. One placeholder serves both
+  // halves of the guard, exactly as the two `?` bound the same value before.
+  const info = await db.query(
     `UPDATE sessions
-        SET revoked_at = ?, revoked_reason = ?
-      WHERE user_id = ? AND revoked_at IS NULL AND (? IS NULL OR id <> ?)`,
-  ).run(Date.now(), reason, userId, keep, keep);
-  return info.changes;
+        SET revoked_at = $1, revoked_reason = $2
+      WHERE user_id = $3 AND revoked_at IS NULL AND ($4::text IS NULL OR id <> $4)`,
+    [Date.now(), reason, userId, keep],
+  );
+  return info.rowCount;
 }
 
 /** Lists the user's live sessions, newest activity first, for the "where you are signed in" view. */
-export function listActiveForUser(userId: string): SessionRecord[] {
-  return stmt<SessionRecord>(
+export async function listActiveForUser(userId: string): Promise<SessionRecord[]> {
+  const db = await getDb();
+  const { rows } = await db.query<SessionRecord>(
     `SELECT ${SELECT_COLUMNS}
        FROM sessions
-      WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
+      WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > $2
       ORDER BY last_used_at DESC`,
-  ).all(userId, Date.now());
+    [userId, Date.now()],
+  );
+  return rows;
 }
 
 /** True only while a session is neither revoked nor expired — the single definition of "still signed in". */
@@ -234,6 +256,7 @@ export function toPublicSession(s: SessionRecord, currentSessionId: string): Pub
 }
 
 /** Records activity on a session so the sessions list shows real last-seen times. */
-export function touch(id: string): void {
-  stmt(`UPDATE sessions SET last_used_at = ? WHERE id = ?`).run(Date.now(), id);
+export async function touch(id: string): Promise<void> {
+  const db = await getDb();
+  await db.query(`UPDATE sessions SET last_used_at = $1 WHERE id = $2`, [Date.now(), id]);
 }

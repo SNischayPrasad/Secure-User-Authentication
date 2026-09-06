@@ -67,13 +67,13 @@ router.get("/", (req, res) => {
 });
 
 /** Endpoint 9 — PATCH /me. Updates the display name and records a profile_update audit event. */
-router.patch("/", requireCsrf, validate({ body: updateProfileSchema }), (req, res) => {
+router.patch("/", requireCsrf, validate({ body: updateProfileSchema }), async (req, res) => {
   const auth = requireAuthContext(req);
   const body = req.body as { name: string };
 
-  const updated = updateProfile(auth.user.id, body.name);
+  const updated = await updateProfile(auth.user.id, body.name);
 
-  recordEvent({
+  await recordEvent({
     userId: auth.user.id,
     type: "profile_update",
     outcome: "success",
@@ -92,14 +92,14 @@ router.post("/password", requireCsrf, validate({ body: changePasswordSchema }), 
   const auth = requireAuthContext(req);
   const body = req.body as { currentPassword: string; newPassword: string };
 
-  const user = findUserById(auth.user.id);
+  const user = await findUserById(auth.user.id);
   if (!user) {
     throw new AppError(401, "TOKEN_INVALID", "Your session is no longer valid. Sign in again.");
   }
 
   const currentOk = await verifyPassword(user.password_hash, body.currentPassword);
   if (!currentOk) {
-    recordEvent({
+    await recordEvent({
       userId: user.id,
       type: "password_change",
       outcome: "failure",
@@ -124,10 +124,10 @@ router.post("/password", requireCsrf, validate({ body: changePasswordSchema }), 
   }
 
   const passwordHash = await hashPassword(body.newPassword);
-  updatePassword(user.id, passwordHash);
-  revokeAllForUser(user.id, "password_changed", auth.sessionId);
+  await updatePassword(user.id, passwordHash);
+  await revokeAllForUser(user.id, "password_changed", auth.sessionId);
 
-  recordEvent({
+  await recordEvent({
     userId: user.id,
     type: "password_change",
     outcome: "success",
@@ -141,10 +141,10 @@ router.post("/password", requireCsrf, validate({ body: changePasswordSchema }), 
  * Endpoint 11 — GET /me/sessions. Lists active sessions with a `current` flag so a person can
  * tell which device they are looking from before revoking the others.
  */
-router.get("/sessions", (req, res) => {
+router.get("/sessions", async (req, res) => {
   const auth = requireAuthContext(req);
 
-  const sessions = listSessions(auth.user.id).map((session) => ({
+  const sessions = (await listSessions(auth.user.id)).map((session) => ({
     id: session.id,
     current: session.id === auth.sessionId,
     userAgent: session.user_agent ?? null,
@@ -161,22 +161,26 @@ router.get("/sessions", (req, res) => {
  * Endpoint 12 — DELETE /me/sessions/:id. Answers 404 for a session owned by anyone else, so the
  * endpoint cannot be used to probe which session ids exist.
  */
-router.delete("/sessions/:id", requireCsrf, validate({ params: idParamSchema }), (req, res) => {
-  const auth = requireAuthContext(req);
-  const id = pathParam(req, "id");
+router.delete(
+  "/sessions/:id",
+  requireCsrf,
+  validate({ params: idParamSchema }),
+  async (req, res) => {
+    const auth = requireAuthContext(req);
+    const id = pathParam(req, "id");
 
-  const session = findSessionById(id);
+  const session = await findSessionById(id);
   if (!session || session.user_id !== auth.user.id) {
     throw new AppError(404, "NOT_FOUND", "That session does not exist.");
   }
 
-  revokeSession(session.id, "revoked_by_user");
+  await revokeSession(session.id, "revoked_by_user");
 
   if (session.id === auth.sessionId) {
     clearRefreshCookie(res);
   }
 
-  recordEvent({
+  await recordEvent({
     userId: auth.user.id,
     type: "session_revoked",
     outcome: "success",
@@ -188,9 +192,9 @@ router.delete("/sessions/:id", requireCsrf, validate({ params: idParamSchema }),
 });
 
 /** Endpoint 13 — GET /me/activity. Returns the caller's last 50 audit events, newest first. */
-router.get("/activity", (req, res) => {
+router.get("/activity", async (req, res) => {
   const auth = requireAuthContext(req);
-  res.status(200).json({ events: listEvents(auth.user.id, 50) });
+  res.status(200).json({ events: await listEvents(auth.user.id, 50) });
 });
 
 /** Router for `/api/v1/me` (endpoints 8-13). */

@@ -1,42 +1,10 @@
-import type Database from "better-sqlite3";
 import type { RequestHandler } from "express";
 
-import { db } from "../db/index.js";
 import { unauthorized } from "../lib/errors.js";
 import type { AccessClaims } from "../lib/tokens.js";
 import { verifyAccessToken } from "../lib/tokens.js";
-import { toPublicUser } from "../services/userService.js";
-import type { UserRecord } from "../types.js";
-
-/** The columns of `sessions` that access-token validation needs. */
-type SessionAuthRow = {
-  id: string;
-  user_id: string;
-  revoked_at: number | null;
-  expires_at: number;
-};
-
-let userByIdStmt: Database.Statement<[string], UserRecord> | undefined;
-let sessionByIdStmt: Database.Statement<[string], SessionAuthRow> | undefined;
-
-/**
- * Lazily compiles the user lookup. Compiled on first use, not at import time, because `migrate()`
- * must have created the tables before SQLite will accept the statement.
- */
-function selectUserById(): Database.Statement<[string], UserRecord> {
-  userByIdStmt ??= db.prepare<[string], UserRecord>(
-    "SELECT * FROM users WHERE id = ?",
-  );
-  return userByIdStmt;
-}
-
-/** Lazily compiles the session lookup (see {@link selectUserById} for why it is lazy). */
-function selectSessionById(): Database.Statement<[string], SessionAuthRow> {
-  sessionByIdStmt ??= db.prepare<[string], SessionAuthRow>(
-    "SELECT id, user_id, revoked_at, expires_at FROM sessions WHERE id = ?",
-  );
-  return sessionByIdStmt;
-}
+import { findById as findSessionById } from "../services/sessionService.js";
+import { findById as findUserById, toPublicUser } from "../services/userService.js";
 
 /**
  * Extracts the credential from an `Authorization: Bearer <jwt>` header.
@@ -65,10 +33,15 @@ function readBearerToken(header: string | undefined): string | null {
  * 4. `iat >= floor(password_changed_at / 1000)` — tokens minted before a password change die with
  *    the old password, so a stolen token cannot outlive the credential it was issued against.
  *
+ * Both lookups go through the service layer rather than through SQL of their own, so the `users`
+ * and `sessions` queries have exactly one definition each. The handler is async because those
+ * services are: Express 5 forwards a rejected promise from an async middleware to the error
+ * handler, so a thrown `AppError` still lands on the same 401 response it always did.
+ *
  * On success it attaches `req.auth = { user, sessionId, claims }`, where `user` is the sanitised
  * `PublicUser` projection so no password material can reach a response.
  */
-export const authenticate: RequestHandler = (req, _res, next) => {
+export const authenticate: RequestHandler = async (req, _res, next) => {
   const token = readBearerToken(req.get("authorization"));
   if (!token) {
     next(unauthorized("AUTH_REQUIRED", "Sign in to access this resource."));
@@ -78,7 +51,7 @@ export const authenticate: RequestHandler = (req, _res, next) => {
   // Throws AppError 401 TOKEN_EXPIRED / TOKEN_INVALID, which Express forwards to the error handler.
   const claims: AccessClaims = verifyAccessToken(token);
 
-  const user = selectUserById().get(claims.sub);
+  const user = await findUserById(claims.sub);
   if (!user) {
     // Deliberately TOKEN_INVALID, not NOT_FOUND: the token is what is unusable, and we do not
     // confirm to an unauthenticated caller whether a given account id exists.
@@ -86,7 +59,7 @@ export const authenticate: RequestHandler = (req, _res, next) => {
     return;
   }
 
-  const session = selectSessionById().get(claims.sid);
+  const session = await findSessionById(claims.sid);
   const now = Date.now();
   if (
     !session ||

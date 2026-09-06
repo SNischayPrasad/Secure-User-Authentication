@@ -1,7 +1,7 @@
 import { platform } from "node:process";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { closeDb, db } from "./index.js";
+import { closeDb, getDb } from "./index.js";
 import { migrate } from "./migrate.js";
 import { newId } from "../lib/crypto.js";
 import { hashPassword } from "../lib/password.js";
@@ -76,11 +76,15 @@ const DEMO_VAULT_ITEMS: ReadonlyArray<{ title: string; body: string }> = [
  * account exercises exactly the same verification path as a registered one.
  */
 export async function seed(): Promise<SeedResult> {
-  migrate();
+  await migrate();
 
-  const existing = db
-    .prepare<[string], { id: string }>("SELECT id FROM users WHERE email_canonical = ?")
-    .get(DEMO_EMAIL);
+  const db = await getDb();
+
+  const { rows } = await db.query<{ id: string }>(
+    "SELECT id FROM users WHERE email_canonical = $1",
+    [DEMO_EMAIL],
+  );
+  const existing = rows[0];
 
   if (existing) {
     console.log(`[seed] ${DEMO_EMAIL} already exists (${existing.id}) — nothing to do.`);
@@ -91,67 +95,33 @@ export async function seed(): Promise<SeedResult> {
   const now = Date.now();
   const userId = newId("usr");
 
-  const insertUser = db.prepare<{
-    id: string;
-    email: string;
-    emailCanonical: string;
-    name: string;
-    passwordHash: string;
-    passwordChangedAt: number;
-    createdAt: number;
-    updatedAt: number;
-  }>(
-    `INSERT INTO users (
-       id, email, email_canonical, name, password_hash, password_algo, role,
-       failed_attempts, locked_until, password_changed_at, created_at, updated_at
-     ) VALUES (
-       @id, @email, @emailCanonical, @name, @passwordHash, 'argon2id', 'user',
-       0, NULL, @passwordChangedAt, @createdAt, @updatedAt
-     )`,
-  );
-
-  const insertItem = db.prepare<{
-    id: string;
-    userId: string;
-    title: string;
-    body: string;
-    createdAt: number;
-    updatedAt: number;
-  }>(
-    `INSERT INTO vault_items (id, user_id, title, body, created_at, updated_at)
-     VALUES (@id, @userId, @title, @body, @createdAt, @updatedAt)`,
-  );
-
-  const insertAll = db.transaction((): number => {
-    insertUser.run({
-      id: userId,
-      email: DEMO_EMAIL,
-      emailCanonical: DEMO_EMAIL,
-      name: DEMO_NAME,
-      passwordHash,
-      passwordChangedAt: now,
-      createdAt: now,
-      updatedAt: now,
-    });
+  // The user and their items land together or not at all, so a failure part way through
+  // cannot leave a demo account with a half-populated vault.
+  const vaultItemsCreated = await db.transaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO users (
+         id, email, email_canonical, name, password_hash, password_algo, role,
+         failed_attempts, locked_until, password_changed_at, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, 'argon2id', 'user',
+         0, NULL, $6, $7, $8
+       )`,
+      [userId, DEMO_EMAIL, DEMO_EMAIL, DEMO_NAME, passwordHash, now, now, now],
+    );
 
     let count = 0;
     for (const item of DEMO_VAULT_ITEMS) {
       // Stagger updated_at so the "most recently updated first" ordering is stable.
       const stamp = now - count * 60_000;
-      insertItem.run({
-        id: newId("itm"),
-        userId,
-        title: item.title,
-        body: item.body,
-        createdAt: stamp,
-        updatedAt: stamp,
-      });
+      await tx.query(
+        `INSERT INTO vault_items (id, user_id, title, body, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [newId("itm"), userId, item.title, item.body, stamp, stamp],
+      );
       count += 1;
     }
     return count;
   });
-
-  const vaultItemsCreated = insertAll();
 
   console.log(`[seed] created user ${DEMO_NAME} <${DEMO_EMAIL}> (${userId})`);
   console.log(`[seed] created ${vaultItemsCreated} vault items`);
@@ -167,21 +137,26 @@ export async function seed(): Promise<SeedResult> {
 function isDirectRun(): boolean {
   const entry = process.argv[1];
   if (entry === undefined) return false;
-  const normalise = (p: string): string => {
-    const abs = resolve(p);
-    return platform === "win32" ? abs.replace(/\\/g, "/").toLowerCase() : abs;
+  const normalise = (value: string): string => {
+    // Split on the platform separator rather than matching a backslash in a regex, and
+    // compare case-insensitively on Windows where paths are not case sensitive.
+    const abs = resolve(value).split(sep).join("/");
+    return platform === "win32" ? abs.toLowerCase() : abs;
   };
   return normalise(entry) === normalise(fileURLToPath(import.meta.url));
 }
 
 if (isDirectRun()) {
-  seed()
-    .then(() => {
-      closeDb();
-    })
-    .catch((error: unknown) => {
+  void (async (): Promise<void> => {
+    try {
+      await seed();
+    } catch (error: unknown) {
       console.error("[seed] failed:", error);
-      closeDb();
       process.exitCode = 1;
-    });
+    } finally {
+      // Closing is awaited: the pool (or the PGlite instance) shuts down before the process
+      // exits, so the CLI never leaves a half-written connection behind.
+      await closeDb();
+    }
+  })();
 }

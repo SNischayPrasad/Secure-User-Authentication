@@ -44,17 +44,17 @@ const router = Router();
 router.use(authenticate);
 
 /** Endpoint 14 — GET /vault. Lists only the caller's items, newest change first. */
-router.get("/", (req, res) => {
+router.get("/", async (req, res) => {
   const auth = requireAuthContext(req);
-  res.status(200).json({ items: listItems(auth.user.id).map(toPublicVaultItem) });
+  res.status(200).json({ items: (await listItems(auth.user.id)).map(toPublicVaultItem) });
 });
 
 /** Endpoint 15 — POST /vault. Creates an item owned by the caller. */
-router.post("/", requireCsrf, validate({ body: vaultItemSchema }), (req, res) => {
+router.post("/", requireCsrf, validate({ body: vaultItemSchema }), async (req, res) => {
   const auth = requireAuthContext(req);
   const body = req.body as { title: string; body: string };
 
-  const item = createItem(auth.user.id, { title: body.title, body: body.body });
+  const item = await createItem(auth.user.id, { title: body.title, body: body.body });
 
   res.status(201).json({ item: toPublicVaultItem(item) });
 });
@@ -67,7 +67,7 @@ router.patch(
   "/:id",
   requireCsrf,
   validate({ params: idParamSchema, body: vaultItemPatchSchema }),
-  (req, res) => {
+  async (req, res) => {
     const auth = requireAuthContext(req);
     const id = pathParam(req, "id");
     const patch = req.body as { title?: string; body?: string };
@@ -78,7 +78,7 @@ router.patch(
       ]);
     }
 
-    const item = updateItem(auth.user.id, id, patch);
+    const item = await updateItem(auth.user.id, id, patch);
     if (!item) {
       throw new AppError(404, "NOT_FOUND", "That item does not exist.");
     }
@@ -88,11 +88,11 @@ router.patch(
 );
 
 /** Endpoint 17 — DELETE /vault/:id. Scoped to the caller; 404 when the item is not theirs. */
-router.delete("/:id", requireCsrf, validate({ params: idParamSchema }), (req, res) => {
+router.delete("/:id", requireCsrf, validate({ params: idParamSchema }), async (req, res) => {
   const auth = requireAuthContext(req);
   const id = pathParam(req, "id");
 
-  const removed = deleteItem(auth.user.id, id);
+  const removed = await deleteItem(auth.user.id, id);
   if (!removed) {
     throw new AppError(404, "NOT_FOUND", "That item does not exist.");
   }

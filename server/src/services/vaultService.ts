@@ -1,5 +1,4 @@
-import type Database from "better-sqlite3";
-import { db } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { newId } from "../lib/crypto.js";
 import { AppError } from "../lib/errors.js";
 
@@ -10,6 +9,10 @@ import { AppError } from "../lib/errors.js";
  * an item owned by someone else is reported exactly like an item that does not exist (`undefined`
  * / `false`, so the route answers 404 and never 403). Without that, the 403-vs-404 difference would
  * let any signed-in user probe for other people's item ids.
+ *
+ * Writes use `RETURNING` rather than a write followed by a select. On a serverless deployment
+ * every extra statement is another network round trip to the database, and the two-statement form
+ * is also racy: another request could change the row in between.
  */
 
 /** A `vault_items` row exactly as stored. */
@@ -31,20 +34,6 @@ export interface PublicVaultItem {
   updatedAt: number;
 }
 
-const statements = new Map<string, Database.Statement<unknown[], unknown>>();
-
-/**
- * Lazily prepares and caches a statement. Lazy because module import happens before
- * `migrate()` runs, so preparing at import time would fail with "no such table".
- */
-function stmt<R = unknown>(sql: string): Database.Statement<unknown[], R> {
-  const cached = statements.get(sql);
-  if (cached) return cached as Database.Statement<unknown[], R>;
-  const prepared = db.prepare<unknown[], R>(sql);
-  statements.set(sql, prepared as Database.Statement<unknown[], unknown>);
-  return prepared;
-}
-
 const SELECT_COLUMNS = `id, user_id, title, body, created_at, updated_at`;
 
 /** Maps a row to the client shape; `user_id` is dropped because the caller is always the owner. */
@@ -59,30 +48,42 @@ export function toPublicVaultItem(row: VaultItemRecord): PublicVaultItem {
 }
 
 /** Lists one user's items, most recently updated first. */
-export function listForUser(userId: string): VaultItemRecord[] {
-  return stmt<VaultItemRecord>(
-    `SELECT ${SELECT_COLUMNS} FROM vault_items WHERE user_id = ? ORDER BY updated_at DESC`,
-  ).all(userId);
+export async function listForUser(userId: string): Promise<VaultItemRecord[]> {
+  const db = await getDb();
+  const { rows } = await db.query<VaultItemRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM vault_items WHERE user_id = $1 ORDER BY updated_at DESC`,
+    [userId],
+  );
+  return rows;
 }
 
 /** Loads one item owned by `userId`; anything else returns `undefined` so the route answers 404 rather than confirming the id exists. */
-export function findById(userId: string, id: string): VaultItemRecord | undefined {
-  return stmt<VaultItemRecord>(
-    `SELECT ${SELECT_COLUMNS} FROM vault_items WHERE id = ? AND user_id = ?`,
-  ).get(id, userId);
+export async function findById(userId: string, id: string): Promise<VaultItemRecord | undefined> {
+  const db = await getDb();
+  const { rows } = await db.query<VaultItemRecord>(
+    `SELECT ${SELECT_COLUMNS} FROM vault_items WHERE id = $1 AND user_id = $2`,
+    [id, userId],
+  );
+  return rows[0];
 }
 
 /** Creates an item owned by `userId` and returns the stored row. */
-export function create(userId: string, input: { title: string; body: string }): VaultItemRecord {
+export async function create(
+  userId: string,
+  input: { title: string; body: string },
+): Promise<VaultItemRecord> {
+  const db = await getDb();
   const now = Date.now();
   const id = newId("itm");
 
-  stmt(
+  const { rows } = await db.query<VaultItemRecord>(
     `INSERT INTO vault_items (id, user_id, title, body, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, userId, input.title.trim(), input.body.trim(), now, now);
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING ${SELECT_COLUMNS}`,
+    [id, userId, input.title.trim(), input.body.trim(), now, now],
+  );
 
-  const row = findById(userId, id);
+  const row = rows[0];
   if (!row) throw new AppError(500, "INTERNAL_ERROR", "The item could not be saved.");
   return row;
 }
@@ -92,26 +93,32 @@ export function create(userId: string, input: { title: string; body: string }): 
  * checking the owner and writing. Returns `undefined` when the item is missing or owned by
  * someone else — indistinguishable on purpose, so the vault cannot be used to probe for ids.
  */
-export function update(
+export async function update(
   userId: string,
   id: string,
   patch: { title?: string; body?: string },
-): VaultItemRecord | undefined {
+): Promise<VaultItemRecord | undefined> {
+  const db = await getDb();
   const title = patch.title === undefined ? null : patch.title.trim();
   const body = patch.body === undefined ? null : patch.body.trim();
 
-  const info = stmt(
+  const { rows } = await db.query<VaultItemRecord>(
     `UPDATE vault_items
-        SET title = COALESCE(?, title), body = COALESCE(?, body), updated_at = ?
-      WHERE id = ? AND user_id = ?`,
-  ).run(title, body, Date.now(), id, userId);
+        SET title = COALESCE($1, title), body = COALESCE($2, body), updated_at = $3
+      WHERE id = $4 AND user_id = $5
+      RETURNING ${SELECT_COLUMNS}`,
+    [title, body, Date.now(), id, userId],
+  );
 
-  if (info.changes === 0) return undefined;
-  return findById(userId, id);
+  return rows[0];
 }
 
 /** Deletes an item the caller owns; `false` means missing *or* not theirs, so the route answers 404 either way. */
-export function remove(userId: string, id: string): boolean {
-  const info = stmt(`DELETE FROM vault_items WHERE id = ? AND user_id = ?`).run(id, userId);
-  return info.changes > 0;
+export async function remove(userId: string, id: string): Promise<boolean> {
+  const db = await getDb();
+  const { rowCount } = await db.query(
+    `DELETE FROM vault_items WHERE id = $1 AND user_id = $2`,
+    [id, userId],
+  );
+  return rowCount > 0;
 }

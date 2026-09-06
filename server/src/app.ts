@@ -43,6 +43,18 @@ function cspDirectives(): Record<string, string[]> {
 }
 
 /**
+ * Resolves once the schema has been applied.
+ *
+ * Applying it is asynchronous now that the store is Postgres, and `createApp()` must stay
+ * synchronous for supertest and the Vercel handler, so readiness is exposed as its own promise
+ * instead of being awaited during construction. `migrate()` caches its promise for the life of
+ * the process, so every caller here awaits the same one DDL run.
+ */
+export function ready(): Promise<void> {
+  return migrate();
+}
+
+/**
  * Builds the fully wired Express application without binding a port, so tests can drive it through
  * supertest while `index.ts` owns the listening socket.
  *
@@ -52,10 +64,6 @@ function cspDirectives(): Record<string, string[]> {
  * error handler is mounted last so every failure below it is serialised through one envelope.
  */
 export function createApp(): Express {
-  // Schema is idempotent; running it here means anything that imports createApp (tests included)
-  // gets a database that is ready before the first request is served.
-  migrate();
-
   const app = express();
 
   // Do not advertise the framework: it is free reconnaissance for an attacker.
@@ -86,6 +94,19 @@ export function createApp(): Express {
   // Bounded body size: oversized payloads are rejected by the parser and surface as 413.
   app.use(express.json({ limit: "32kb" }));
   app.use(cookieParser());
+
+  // Schema first, before any route can touch a table. On a warm instance this is one await on an
+  // already-resolved promise; on a cold one it serialises the very first requests behind a single
+  // migration. Serverless makes this mandatory: any instance may be the first to reach a fresh
+  // database, and a failure here becomes a normal error response rather than a crashed handler.
+  app.use("/api", async (_req, _res, next) => {
+    try {
+      await ready();
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.use("/api", globalLimiter);
 

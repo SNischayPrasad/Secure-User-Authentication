@@ -32,13 +32,19 @@ import type { SessionRecord } from "../types.js";
  * the raw refresh token to put in the cookie. These two adapters keep that difference in one
  * place instead of spreading destructuring through every handler.
  */
-function createSession(userId: string, req?: Request): { id: string; refreshToken: string } {
-  const { session, refreshToken } = createSessionRecord({ userId, req });
+async function createSession(
+  userId: string,
+  req?: Request,
+): Promise<{ id: string; refreshToken: string }> {
+  const { session, refreshToken } = await createSessionRecord({ userId, req });
   return { id: session.id, refreshToken };
 }
 
-function rotateSession(current: SessionRecord, req?: Request): { id: string; refreshToken: string } {
-  const { session, refreshToken } = rotateSessionRecord(current, req);
+async function rotateSession(
+  current: SessionRecord,
+  req?: Request,
+): Promise<{ id: string; refreshToken: string }> {
+  const { session, refreshToken } = await rotateSessionRecord(current, req);
   return { id: session.id, refreshToken };
 }
 
@@ -111,9 +117,9 @@ function passwordDetails(field: string, issues: string[]): Array<{ field: string
  * Inserts the user, translating a UNIQUE collision on email into 409 so a race between two
  * concurrent registrations cannot surface as a 500.
  */
-function createUserOrConflict(input: { name: string; email: string; passwordHash: string }) {
+async function createUserOrConflict(input: { name: string; email: string; passwordHash: string }) {
   try {
-    return createUser(input);
+    return await createUser(input);
   } catch (err) {
     if (err instanceof Error && /unique|constraint/i.test(err.message)) {
       throw new AppError(409, "EMAIL_TAKEN", "That email address is already registered.");
@@ -159,14 +165,14 @@ router.post("/register", validate({ body: registerSchema }), async (req, res) =>
     );
   }
 
-  if (findUserByEmail(body.email)) {
+  if (await findUserByEmail(body.email)) {
     throw new AppError(409, "EMAIL_TAKEN", "That email address is already registered.");
   }
 
   const passwordHash = await hashPassword(body.password);
-  const user = createUserOrConflict({ name: body.name, email: body.email, passwordHash });
+  const user = await createUserOrConflict({ name: body.name, email: body.email, passwordHash });
 
-  const session = createSession(user.id, asRequest(req));
+  const session = await createSession(user.id, asRequest(req));
   setRefreshCookie(res, session.refreshToken);
 
   const access = signAccessToken(
@@ -174,7 +180,7 @@ router.post("/register", validate({ body: registerSchema }), async (req, res) =>
     session.id,
   );
 
-  recordEvent({
+  await recordEvent({
     userId: user.id,
     emailAttempted: user.email,
     type: "register",
@@ -196,11 +202,11 @@ router.post("/register", validate({ body: registerSchema }), async (req, res) =>
  */
 router.post("/login", validate({ body: loginSchema }), async (req, res) => {
   const body = req.body as { email: string; password: string };
-  const user = findUserByEmail(body.email);
+  const user = await findUserByEmail(body.email);
 
   if (!user) {
     await verifyPassword(await getDummyHash(), body.password);
-    recordEvent({
+    await recordEvent({
       userId: null,
       emailAttempted: body.email,
       type: "login",
@@ -224,8 +230,8 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
 
   const passwordOk = await verifyPassword(user.password_hash, body.password);
   if (!passwordOk) {
-    registerFailedLogin(user.id);
-    recordEvent({
+    await registerFailedLogin(user.id);
+    await recordEvent({
       userId: user.id,
       emailAttempted: body.email,
       type: "login",
@@ -236,9 +242,9 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
     throw new AppError(401, "INVALID_CREDENTIALS", "Email or password is incorrect.");
   }
 
-  clearLoginFailures(user.id);
+  await clearLoginFailures(user.id);
 
-  const session = createSession(user.id, asRequest(req));
+  const session = await createSession(user.id, asRequest(req));
   setRefreshCookie(res, session.refreshToken);
 
   const access = signAccessToken(
@@ -246,7 +252,7 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
     session.id,
   );
 
-  recordEvent({
+  await recordEvent({
     userId: user.id,
     emailAttempted: user.email,
     type: "login",
@@ -266,20 +272,20 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
  * was already rotated means the cookie leaked, so the entire family is revoked rather than
  * silently issuing the attacker a fresh pair.
  */
-router.post("/refresh", requireCsrf, (req, res) => {
+router.post("/refresh", requireCsrf, async (req, res) => {
   const presented = readRefreshCookie(req);
   if (!presented) {
     throw sessionInvalid(res);
   }
 
-  const session = findSessionByRefreshToken(presented);
+  const session = await findSessionByRefreshToken(presented);
   if (!session) {
     throw sessionInvalid(res);
   }
 
   if (typeof session.revoked_at === "number") {
-    revokeFamily(session.family_id, "reuse_detected");
-    recordEvent({
+    await revokeFamily(session.family_id, "reuse_detected");
+    await recordEvent({
       userId: session.user_id,
       type: "token_reuse_detected",
       outcome: "failure",
@@ -298,12 +304,12 @@ router.post("/refresh", requireCsrf, (req, res) => {
     throw sessionInvalid(res);
   }
 
-  const user = findUserById(session.user_id);
+  const user = await findUserById(session.user_id);
   if (!user) {
     throw sessionInvalid(res);
   }
 
-  const rotated = rotateSession(session, asRequest(req));
+  const rotated = await rotateSession(session, asRequest(req));
   setRefreshCookie(res, rotated.refreshToken);
 
   const access = signAccessToken(
@@ -311,7 +317,7 @@ router.post("/refresh", requireCsrf, (req, res) => {
     rotated.id,
   );
 
-  recordEvent({
+  await recordEvent({
     userId: user.id,
     type: "token_refresh",
     outcome: "success",
@@ -326,14 +332,14 @@ router.post("/refresh", requireCsrf, (req, res) => {
  * Endpoint 6 — POST /auth/logout. Revokes only the presented session and is idempotent: a
  * caller with no cookie still gets 204, so a client can always reach a signed-out state.
  */
-router.post("/logout", requireCsrf, (req, res) => {
+router.post("/logout", requireCsrf, async (req, res) => {
   const presented = readRefreshCookie(req);
 
   if (presented) {
-    const session = findSessionByRefreshToken(presented);
+    const session = await findSessionByRefreshToken(presented);
     if (session && typeof session.revoked_at !== "number") {
-      revokeSession(session.id, "logout");
-      recordEvent({
+      await revokeSession(session.id, "logout");
+      await recordEvent({
         userId: session.user_id,
         type: "logout",
         outcome: "success",
@@ -351,13 +357,13 @@ router.post("/logout", requireCsrf, (req, res) => {
  * Endpoint 7 — POST /auth/logout-all. Revokes every session for the user, which also cuts off
  * access tokens already minted because `authenticate` re-checks the session behind each `sid`.
  */
-router.post("/logout-all", authenticate, requireCsrf, (req, res) => {
+router.post("/logout-all", authenticate, requireCsrf, async (req, res) => {
   const auth = requireAuthContext(req);
 
-  revokeAllForUser(auth.user.id, "logout_all");
+  await revokeAllForUser(auth.user.id, "logout_all");
   clearRefreshCookie(res);
 
-  recordEvent({
+  await recordEvent({
     userId: auth.user.id,
     type: "logout_all",
     outcome: "success",

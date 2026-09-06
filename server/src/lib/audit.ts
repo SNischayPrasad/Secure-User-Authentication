@@ -1,5 +1,5 @@
 import type { Request } from "express";
-import { db } from "../db/index.js";
+import { getDb } from "../db/index.js";
 import { newId } from "./crypto.js";
 
 /** The event names written to `auth_events.type`. Kept as a union so callers cannot invent a name silently. */
@@ -73,15 +73,15 @@ type AuthEventRow = {
 const INSERT_EVENT_SQL = `
   INSERT INTO auth_events
     (id, user_id, email_attempted, type, outcome, detail, ip_address, user_agent, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 `;
 
 const LIST_EVENTS_SQL = `
   SELECT id, user_id, email_attempted, type, outcome, detail, ip_address, user_agent, created_at
   FROM auth_events
-  WHERE user_id = ?
+  WHERE user_id = $1
   ORDER BY created_at DESC, id DESC
-  LIMIT ?
+  LIMIT $2
 `;
 
 /** Upper bound on how many events one call can return, so a hostile `limit` cannot drain the table. */
@@ -95,12 +95,16 @@ const MAX_IP_LENGTH = 64;
 
 /**
  * Appends one row to the audit log, deriving IP and user-agent from the request when given.
- * Never throws: an audit write must not be able to fail a login or a logout, so any error is
- * logged server-side and swallowed rather than surfaced to the caller.
+ *
+ * The returned promise never rejects: an audit write must not be able to fail a login or a
+ * logout, so any error — including a failure to reach the database at all — is logged
+ * server-side and swallowed rather than surfaced to the caller. Callers may await it or leave
+ * it floating; both are safe.
  */
-export function recordEvent(e: AuthEventInput): void {
+export async function recordEvent(e: AuthEventInput): Promise<void> {
   try {
-    db.prepare(INSERT_EVENT_SQL).run(
+    const db = await getDb();
+    await db.query(INSERT_EVENT_SQL, [
       newId("evt"),
       e.userId ?? null,
       e.emailAttempted ?? null,
@@ -110,7 +114,7 @@ export function recordEvent(e: AuthEventInput): void {
       clientIp(e.req),
       clientUserAgent(e.req),
       Date.now(),
-    );
+    ]);
   } catch (err) {
     console.error(`[audit] failed to record "${e.type}" (${e.outcome})`, err);
   }
@@ -120,9 +124,10 @@ export function recordEvent(e: AuthEventInput): void {
  * Returns a user's most recent audit events, newest first.
  * Scoped to a single `userId` so one account can never read another account's security history.
  */
-export function listEvents(userId: string, limit = 50): AuthEvent[] {
+export async function listEvents(userId: string, limit = 50): Promise<AuthEvent[]> {
+  const db = await getDb();
   const safeLimit = clampLimit(limit);
-  const rows = db.prepare<unknown[], AuthEventRow>(LIST_EVENTS_SQL).all(userId, safeLimit);
+  const { rows } = await db.query<AuthEventRow>(LIST_EVENTS_SQL, [userId, safeLimit]);
   return rows.map(toAuthEvent);
 }
 

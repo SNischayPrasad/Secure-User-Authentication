@@ -32,11 +32,12 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 let shuttingDown = false;
 
 /**
- * Stops accepting connections, drains in-flight requests, then closes SQLite.
+ * Stops accepting connections, drains in-flight requests, then closes the database connection.
  *
  * Guarded against re-entry so a second Ctrl-C (or SIGTERM arriving after SIGINT) cannot close the
  * database twice or race the exit; a hard timer guarantees the process still dies if a request
- * hangs, and the WAL is checkpointed by `closeDb()` rather than being left to a killed process.
+ * hangs, and the connection is shut down by `closeDb()` — awaited, so the pool has actually
+ * drained before the process exits — rather than being left to a killed process.
  */
 function shutdown(signal: NodeJS.Signals): void {
   if (shuttingDown) return;
@@ -50,7 +51,7 @@ function shutdown(signal: NodeJS.Signals): void {
   }, SHUTDOWN_GRACE_MS);
   forceExit.unref();
 
-  server.close((err?: Error) => {
+  server.close(async (err?: Error) => {
     clearTimeout(forceExit);
 
     if (err) {
@@ -58,7 +59,7 @@ function shutdown(signal: NodeJS.Signals): void {
     }
 
     try {
-      closeDb();
+      await closeDb();
     } catch (dbErr) {
       console.error("Error while closing the database:", dbErr);
       process.exit(1);

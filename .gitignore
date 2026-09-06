@@ -9,14 +9,14 @@ npm-debug.log*
 .env.*
 !.env.example
 
-# SQLite database files
+# Local database files (PGlite stores a directory tree)
+server/data/
 *.sqlite
 *.sqlite3
 *.db
-*.db-journal
-*.db-wal
-*.db-shm
-server/data/
+
+# Vercel
+.vercel/
 
 # Editor / OS
 .DS_Store

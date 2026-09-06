@@ -6,7 +6,17 @@ every use with **reuse detection**, session revocation that cuts off tokens that
 yet, and a protected resource that returns data only to the account that owns it.
 
 Full stack: an Express 5 + TypeScript API over PostgreSQL, and a React 19 + Vite client.
-Deployable to Vercel as-is.
+
+**Live: <https://secure-user-authentication-server-y.vercel.app>**
+&nbsp;&nbsp;·&nbsp;&nbsp; sign in with `ada@example.com` / `correct-horse-battery-staple-9`
+
+Running on Vercel with Neon Postgres. All 54 end-to-end checks in `scripts/smoke.mjs` pass
+against that deployment, including refresh-token rotation, reuse detection, revocation and
+account lockout:
+
+```bash
+SMOKE_BASE=https://secure-user-authentication-server-y.vercel.app node scripts/smoke.mjs
+```
 
 <p align="center">
   <img src="docs/screenshots/01-landing.png" alt="The landing page: a credential card with guilloche linework, a foil seal, and a live machine-readable zone" width="900">
@@ -383,6 +393,16 @@ you see `SERVER_MISCONFIGURED` from the API, this is why.
 Import the repository at [vercel.com/new](https://vercel.com/new) and accept the detected
 settings — `vercel.json` already specifies the build command, output directory and function
 configuration. Every push to `main` then redeploys.
+
+Two things are worth knowing, because both cost a deploy cycle to discover:
+
+- Vercel pre-fills the environment variables it finds in `server/.env.example`, **with empty
+  values**. Remove them. An empty `NODE_ENV` or `PORT` fails validation at boot; everything
+  except `JWT_SECRET` already has a working default.
+- Vercel's filesystem routing did not give `api/[...path].ts` catch-all semantics for this
+  project — `/api/health` reached the function while `/api/v1/me` returned a platform 404. The
+  API is therefore routed by an explicit rewrite in `vercel.json` that carries the original path
+  in a `__path` parameter, which `api/index.ts` restores onto `req.url`.
 
 Optionally seed the demo account against the deployed database:
 

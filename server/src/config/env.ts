@@ -200,12 +200,29 @@ function loadEnv(): AppEnv {
   const data = parsed.data;
   const production = data.NODE_ENV === "production";
 
+  const databaseUrl = data.DATABASE_URL ?? data.POSTGRES_URL ?? data.DATABASE_POSTGRES_URL ?? null;
+
+  // Without a connection string the server falls back to PGlite, which keeps its data in a
+  // directory on the local filesystem. That is exactly right in development and impossible in a
+  // serverless deployment, where the filesystem is read-only and each instance is discarded —
+  // it would "work" until the first cold start and then silently lose every account. Refusing to
+  // boot turns that into an obvious deployment error instead of a data-loss bug.
+  if (production && !databaseUrl) {
+    throw new Error(
+      "DATABASE_URL is required when NODE_ENV=production. The in-process PGlite fallback " +
+        "stores data on the local filesystem, which is read-only and ephemeral on a serverless " +
+        "host, so any account created there would be lost on the next cold start. Attach a " +
+        "Postgres database (on Vercel: Storage > Create Database > Neon) and the connection " +
+        "string will be injected automatically.",
+    );
+  }
+
   return Object.freeze({
     nodeEnv: data.NODE_ENV,
     port: data.PORT,
     webOrigin: data.WEB_ORIGIN,
     databaseFile: data.DATABASE_FILE,
-    databaseUrl: data.DATABASE_URL ?? data.POSTGRES_URL ?? data.DATABASE_POSTGRES_URL ?? null,
+    databaseUrl,
     jwtSecret: resolveJwtSecret(data.JWT_SECRET, production),
     jwtIssuer: data.JWT_ISSUER,
     jwtAudience: data.JWT_AUDIENCE,

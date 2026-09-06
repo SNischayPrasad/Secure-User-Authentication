@@ -24,6 +24,8 @@ export default defineConfig({
     env: {
       NODE_ENV: "test",
       DATABASE_FILE: ":memory:",
+      // Names a fixture account so the demo-account guard is exercised by the suite.
+      DEMO_ACCOUNT_EMAIL: "demo-fixture@example.test",
       JWT_SECRET: "test-secret-that-is-definitely-long-enough-32",
     },
   },

@@ -7,15 +7,18 @@ yet, and a protected resource that returns data only to the account that owns it
 
 Full stack: an Express 5 + TypeScript API over PostgreSQL, and a React 19 + Vite client.
 
-**Live: <https://secure-user-authentication-server-y.vercel.app>**
+**Live: <https://secure-user-authentication.vercel.app>**
 &nbsp;&nbsp;·&nbsp;&nbsp; sign in with `ada@example.com` / `correct-horse-battery-staple-9`
+
+That is a shared account and its password is public, so the server refuses to change it — see
+[the demo account](#the-demo-account). Register your own to exercise the full flow.
 
 Running on Vercel with Neon Postgres. All 54 end-to-end checks in `scripts/smoke.mjs` pass
 against that deployment, including refresh-token rotation, reuse detection, revocation and
 account lockout:
 
 ```bash
-SMOKE_BASE=https://secure-user-authentication-server-y.vercel.app node scripts/smoke.mjs
+SMOKE_BASE=https://secure-user-authentication.vercel.app node scripts/smoke.mjs
 ```
 
 <p align="center">
@@ -35,6 +38,7 @@ SMOKE_BASE=https://secure-user-authentication-server-y.vercel.app node scripts/s
 - [Project layout](#project-layout)
 - [Testing](#testing)
 - [Deploying to Vercel](#deploying-to-vercel)
+- [The demo account](#the-demo-account)
 - [Configuration](#configuration)
 - [What is deliberately not here](#what-is-deliberately-not-here)
 
@@ -287,6 +291,7 @@ Every failure uses the same envelope:
 | `404` | `NOT_FOUND` / `ROUTE_NOT_FOUND` | No such resource, or no such route. |
 | `409` | `EMAIL_TAKEN` | That email is already registered. |
 | `413` | `PAYLOAD_TOO_LARGE` | Body over 32 kB. |
+| `403` | `DEMO_ACCOUNT_PROTECTED` | The shared demo account may not change its own password. |
 | `423` | `ACCOUNT_LOCKED` | Too many failed logins. `details.retryAfterSeconds` says when to retry. |
 | `429` | `RATE_LIMITED` | Rate limit tripped. `Retry-After` is set. |
 | `500` | `INTERNAL_ERROR` | Unexpected. Never leaks a stack or an internal message in production. |
@@ -399,6 +404,8 @@ Two things are worth knowing, because both cost a deploy cycle to discover:
 - Vercel pre-fills the environment variables it finds in `server/.env.example`, **with empty
   values**. Remove them. An empty `NODE_ENV` or `PORT` fails validation at boot; everything
   except `JWT_SECRET` already has a working default.
+- If you publish demo credentials, set `DEMO_ACCOUNT_EMAIL` so that account cannot have its
+  password changed out from under you.
 - Vercel's filesystem routing did not give `api/[...path].ts` catch-all semantics for this
   project — `/api/health` reached the function while `/api/v1/me` returned a platform 404. The
   API is therefore routed by an explicit rewrite in `vercel.json` that carries the original path
@@ -428,6 +435,24 @@ SMOKE_BASE=https://your-deployment.vercel.app node scripts/smoke.mjs
 
 ---
 
+## The demo account
+
+The deployed instance advertises `ada@example.com` so a reviewer can see the signed-in views
+without registering. Publishing working credentials has an obvious consequence: anyone can sign
+in as that account — and, without a guard, change its password and lock out everyone after them.
+
+So when `DEMO_ACCOUNT_EMAIL` names an account, the server refuses `POST /api/v1/me/password` for
+that one account with `403 DEMO_ACCOUNT_PROTECTED`. Everything else about it is a completely
+ordinary account: same Argon2id hash, same session handling, same revocation. Two tests cover it —
+one asserting the demo account cannot rotate its password and that the published credentials still
+work afterwards, one asserting every other account still can.
+
+The variable is unset by default, so a real deployment carries none of this behaviour. Its vault
+is deliberately left writable: adding and deleting notes is the point of the protected-resource
+demo, and the worst case is that it looks lived-in.
+
+---
+
 ## Configuration
 
 `server/.env` — see `server/.env.example`.
@@ -443,6 +468,7 @@ SMOKE_BASE=https://your-deployment.vercel.app node scripts/smoke.mjs
 | `JWT_ISSUER` | `secure-user-auth` | Verified on every token |
 | `JWT_AUDIENCE` | `secure-user-auth.web` | Verified on every token |
 | `ACCESS_TOKEN_TTL` | `900` | Seconds |
+| `DEMO_ACCOUNT_EMAIL` | — | Optional. Names a shared public demo account whose password cannot be changed. |
 | `REFRESH_TOKEN_TTL` | `604800` | Seconds |
 
 In development, leaving `JWT_SECRET` empty generates an ephemeral secret at boot and logs a

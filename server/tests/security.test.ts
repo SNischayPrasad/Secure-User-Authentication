@@ -393,3 +393,42 @@ describe("account enumeration", () => {
     }
   });
 });
+
+describe("shared demo account", () => {
+  const DEMO_EMAIL = "demo-fixture@example.test";
+
+  it("refuses to let the published demo account change its own password", async () => {
+    const agent = request.agent(app);
+    const account = await register(agent, { email: DEMO_EMAIL });
+
+    const csrf = await csrfToken(agent);
+    const res = await agent
+      .post("/api/v1/me/password")
+      .set(bearer(account.accessToken))
+      .set("X-CSRF-Token", csrf)
+      .send({ currentPassword: VALID_PASSWORD, newPassword: NEW_PASSWORD });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("DEMO_ACCOUNT_PROTECTED");
+
+    // The credentials published in the README must still work afterwards.
+    const stillWorks = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email: DEMO_EMAIL, password: VALID_PASSWORD });
+    expect(stillWorks.status).toBe(200);
+  });
+
+  it("leaves every other account free to change its password", async () => {
+    const agent = request.agent(app);
+    const account = await register(agent);
+
+    const csrf = await csrfToken(agent);
+    const res = await agent
+      .post("/api/v1/me/password")
+      .set(bearer(account.accessToken))
+      .set("X-CSRF-Token", csrf)
+      .send({ currentPassword: VALID_PASSWORD, newPassword: NEW_PASSWORD });
+
+    expect(res.status).toBe(204);
+  });
+});

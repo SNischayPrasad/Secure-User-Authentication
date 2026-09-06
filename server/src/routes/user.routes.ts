@@ -1,6 +1,7 @@
 import { Router, type Request } from "express";
 
 import { listEvents, recordEvent } from "../lib/audit.js";
+import { env } from "../config/env.js";
 import { AppError } from "../lib/errors.js";
 import { assessPassword, hashPassword, verifyPassword } from "../lib/password.js";
 import { authenticate } from "../middleware/authenticate.js";
@@ -91,6 +92,18 @@ router.patch("/", requireCsrf, validate({ body: updateProfileSchema }), async (r
 router.post("/password", requireCsrf, validate({ body: changePasswordSchema }), async (req, res) => {
   const auth = requireAuthContext(req);
   const body = req.body as { currentPassword: string; newPassword: string };
+
+  // A public demo account's credentials are published so anyone can try the signed-in views.
+  // That also means any visitor could change its password and lock out everyone after them, so
+  // this one account cannot rotate its own. The guard is inert unless DEMO_ACCOUNT_EMAIL names
+  // an account, so it changes nothing for a real deployment.
+  if (env.demoAccountEmail && auth.user.email === env.demoAccountEmail) {
+    throw new AppError(
+      403,
+      "DEMO_ACCOUNT_PROTECTED",
+      "This is a shared demo account, so its password cannot be changed. Create your own account to try this.",
+    );
+  }
 
   const user = await findUserById(auth.user.id);
   if (!user) {

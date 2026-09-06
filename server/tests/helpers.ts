@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------------------
 process.env.NODE_ENV = "test";
 process.env.DATABASE_FILE = ":memory:";
+process.env.DEMO_ACCOUNT_EMAIL = "demo-fixture@example.test";
 process.env.JWT_SECRET = "test-secret-that-is-definitely-long-enough-32";
 process.env.BOOTSTRAP_DEMO_USER = "false";
 

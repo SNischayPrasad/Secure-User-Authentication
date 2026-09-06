@@ -22,6 +22,15 @@ export type AppEnv = {
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   bootstrapDemoUser: boolean;
+  /**
+   * Email of a shared, publicly-advertised demo account, if this instance has one.
+   *
+   * Publishing demo credentials is what makes a deployed demo useful, but it also means any
+   * visitor could change that account's password and lock everyone else out. When this is set,
+   * the server refuses password changes for that one account. It is opt-in and unset by default,
+   * so a real deployment carries none of this behaviour.
+   */
+  demoAccountEmail: string | null;
 };
 
 /** Server package root: `src/config/env.ts` and `dist/config/env.js` both sit two levels down. */
@@ -140,6 +149,7 @@ const envSchema = z.object({
   POSTGRES_URL: z.string().min(1).optional(),
   DATABASE_POSTGRES_URL: z.string().min(1).optional(),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters.").optional(),
+  DEMO_ACCOUNT_EMAIL: z.string().trim().toLowerCase().email().optional(),
   JWT_ISSUER: z.string().min(1, "JWT_ISSUER must not be empty."),
   JWT_AUDIENCE: z.string().min(1, "JWT_AUDIENCE must not be empty."),
   ACCESS_TOKEN_TTL: integerEnv("ACCESS_TOKEN_TTL", 60, 86400),
@@ -223,6 +233,7 @@ function loadEnv(): AppEnv {
     webOrigin: data.WEB_ORIGIN,
     databaseFile: data.DATABASE_FILE,
     databaseUrl,
+    demoAccountEmail: data.DEMO_ACCOUNT_EMAIL ?? null,
     jwtSecret: resolveJwtSecret(data.JWT_SECRET, production),
     jwtIssuer: data.JWT_ISSUER,
     jwtAudience: data.JWT_AUDIENCE,

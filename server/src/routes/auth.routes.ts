@@ -7,6 +7,7 @@ import { assessPassword, getDummyHash, hashPassword, verifyPassword } from "../l
 import { signAccessToken } from "../lib/tokens.js";
 import { authenticate } from "../middleware/authenticate.js";
 import { issueCsrfToken, requireCsrf } from "../middleware/csrf.js";
+import { authLimiter, refreshLimiter } from "../middleware/rateLimit.js";
 import { validate } from "../middleware/validate.js";
 import { loginSchema, registerSchema } from "../schemas/auth.js";
 import {
@@ -152,7 +153,7 @@ router.get("/csrf", (_req, res) => {
  * Endpoint 3 — POST /auth/register. Enforces the password policy before any hashing work,
  * then issues a session so the caller is signed in immediately.
  */
-router.post("/register", validate({ body: registerSchema }), async (req, res) => {
+router.post("/register", authLimiter, validate({ body: registerSchema }), async (req, res) => {
   const body = req.body as { name: string; email: string; password: string };
 
   const assessment = assessPassword(body.password, { email: body.email, name: body.name });
@@ -200,7 +201,7 @@ router.post("/register", validate({ body: registerSchema }), async (req, res) =>
  * dummy hash and returns the same generic 401 as a wrong password, so login cannot be used to
  * enumerate accounts by response body or by timing.
  */
-router.post("/login", validate({ body: loginSchema }), async (req, res) => {
+router.post("/login", authLimiter, validate({ body: loginSchema }), async (req, res) => {
   const body = req.body as { email: string; password: string };
   const user = await findUserByEmail(body.email);
 
@@ -230,7 +231,21 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
 
   const passwordOk = await verifyPassword(user.password_hash, body.password);
   if (!passwordOk) {
-    await registerFailedLogin(user.id);
+    const failure = await registerFailedLogin(user.id);
+
+    // Recorded on the transition into the lock, not on every rejected attempt, so the audit log
+    // shows one row per lockout rather than one per guess.
+    if (failure.lockedUntil !== null) {
+      await recordEvent({
+        userId: user.id,
+        emailAttempted: body.email,
+        type: "account_locked",
+        outcome: "failure",
+        detail: `attempts=${failure.attempts}`,
+        req: asRequest(req),
+      });
+    }
+
     await recordEvent({
       userId: user.id,
       emailAttempted: body.email,
@@ -272,7 +287,7 @@ router.post("/login", validate({ body: loginSchema }), async (req, res) => {
  * was already rotated means the cookie leaked, so the entire family is revoked rather than
  * silently issuing the attacker a fresh pair.
  */
-router.post("/refresh", requireCsrf, async (req, res) => {
+router.post("/refresh", refreshLimiter, requireCsrf, async (req, res) => {
   const presented = readRefreshCookie(req);
   if (!presented) {
     throw sessionInvalid(res);

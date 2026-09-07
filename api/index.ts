@@ -42,7 +42,16 @@ function restoreOriginalUrl(req: IncomingMessage): void {
 
   parsed.searchParams.delete("__path");
   const query = parsed.searchParams.toString();
-  req.url = `/api/${forwarded}${query ? `?${query}` : ""}`;
+
+  // `searchParams.get` percent-DECODES, so splicing the result straight back into the URL would
+  // turn an encoded "%2F" or "%3F" inside a path segment into a real separator and change which
+  // route Express matches. Re-encode each segment to put it back exactly as it arrived.
+  const path = forwarded
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+  req.url = `/api/${path}${query ? `?${query}` : ""}`;
 }
 
 export default function handler(req: IncomingMessage, res: ServerResponse): void {

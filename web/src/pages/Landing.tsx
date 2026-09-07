@@ -100,7 +100,7 @@ export function Landing() {
             </div>
 
             <p className="hero__note">
-              Demo account after <span className="mono">npm run seed</span>:{" "}
+              Demo account:{" "}
               <span style={{ color: "var(--paper-dim)" }}>ada@example.com</span> ·{" "}
               <span style={{ color: "var(--paper-dim)" }}>correct-horse-battery-staple-9</span>
             </p>
@@ -243,7 +243,7 @@ curl -s http://localhost:4000/api/v1/me \\
           <span>
             Secure User Authentication — a working reference implementation, not a product.
           </span>
-          <span className="footer__mono">Argon2id · JWT HS256 · rotating refresh · SQLite</span>
+          <span className="footer__mono">Argon2id · JWT HS256 · rotating refresh · PostgreSQL</span>
         </div>
       </footer>
     </>

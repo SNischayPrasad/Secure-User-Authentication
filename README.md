@@ -343,7 +343,7 @@ docs/api.md                    Full request and response reference
 ## Testing
 
 ```bash
-npm test                 # 43 integration tests (vitest + supertest)
+npm test                 # 45 integration tests (vitest + supertest)
 node scripts/smoke.mjs   # 54 end-to-end checks against a running server
 npm run typecheck        # strict TypeScript, both workspaces
 ```
@@ -359,9 +359,10 @@ appears nowhere in it.
 ## Deploying to Vercel
 
 The repository is deployment-ready: `vercel.json` builds the client and exposes the same Express
-app as a serverless function at `api/[...path].ts`. A catch-all function file, rather than a
-rewrite, is what keeps `req.url` as the real path so Express routes on it unchanged — the code
-running in production is the same `createApp()` the test suite drives.
+app as a serverless function at `api/index.ts`. Every `/api/*` request is rewritten to it with
+the original path carried in a `__path` parameter that the handler restores onto `req.url`, so
+Express routes on the real path — the code running in production is the same `createApp()` the
+test suite drives.
 
 Two things must be set up once, because neither can be inferred.
 

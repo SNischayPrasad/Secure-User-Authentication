@@ -109,17 +109,28 @@ function wrapPglite(lite: PGlite): Db {
 
 async function connect(): Promise<Db> {
   if (env.databaseUrl) {
+    const local = env.databaseUrl.includes("localhost") || env.databaseUrl.includes("127.0.0.1");
     const pool = new pg.Pool({
       connectionString: env.databaseUrl,
-      // Managed Postgres (Neon and friends) terminates plaintext connections. Certificate
-      // verification is left to the driver default for the platform CA.
-      ssl: env.databaseUrl.includes("localhost") ? false : { rejectUnauthorized: false },
+      // Managed Postgres (Neon and friends) requires TLS, and the certificate IS verified against
+      // Node's bundled CA store. An earlier version passed `rejectUnauthorized: false` while
+      // claiming the opposite in this comment — that silently accepted any certificate, which
+      // gives an active network attacker the whole database.
+      ssl: local ? false : { rejectUnauthorized: true },
       // Serverless invocations are short and numerous; a small ceiling per instance keeps the
       // provider's connection limit from being exhausted by concurrent cold starts.
       max: isProd ? 3 : 10,
       idleTimeoutMillis: 10_000,
       connectionTimeoutMillis: 10_000,
     });
+    // node-postgres emits "error" on a pooled connection that dies while idle — which managed
+    // providers do routinely, and Neon's autosuspend does deliberately. An EventEmitter with no
+    // "error" listener throws, so without this an idle disconnect takes down the whole instance
+    // rather than being retried on the next checkout.
+    pool.on("error", (error) => {
+      console.error("[db] idle client error (the pool will replace the connection):", error);
+    });
+
     closer = () => pool.end();
     return wrapPool(pool);
   }

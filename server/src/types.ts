@@ -30,8 +30,7 @@ export type AuthEventType =
   | "password_change"
   | "profile_update"
   | "session_revoked"
-  | "account_locked"
-  | "rate_limited";
+  | "account_locked";
 
 /** Outcome recorded on every audit event; mirrors `auth_events.outcome`. */
 export type AuthEventOutcome = "success" | "failure";

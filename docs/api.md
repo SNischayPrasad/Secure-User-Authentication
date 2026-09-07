@@ -126,7 +126,7 @@ local-part, not a known-breached password, and no keyboard or counting runs.
 | `400` | `VALIDATION_FAILED` — missing or malformed fields |
 | `400` | `WEAK_PASSWORD` — `details` lists every rule the password breaks |
 | `409` | `EMAIL_TAKEN` |
-| `429` | `RATE_LIMITED` |
+| `429` | `RATE_LIMITED` — 10 attempts per 15 minutes per IP + email |
 
 A `WEAK_PASSWORD` response:
 
@@ -158,7 +158,7 @@ A `WEAK_PASSWORD` response:
 | `400` | `VALIDATION_FAILED` | |
 | `401` | `INVALID_CREDENTIALS` | Identical body for a wrong password and an unknown email. An unknown email still runs a full Argon2id verification against a dummy hash, so timing does not distinguish them either. |
 | `423` | `ACCOUNT_LOCKED` | After 5 failures. `details.retryAfterSeconds` says when to retry. |
-| `429` | `RATE_LIMITED` | |
+| `429` | `RATE_LIMITED` | 10 attempts per 15 minutes per IP + email |
 
 ---
 
@@ -234,6 +234,7 @@ stays signed in and every other device is signed out.
 |---|---|
 | `400` | `WEAK_PASSWORD`, `SAME_PASSWORD`, `VALIDATION_FAILED` |
 | `401` | `INVALID_CREDENTIALS` — `currentPassword` wrong |
+| `403` | `DEMO_ACCOUNT_PROTECTED` — this account is the shared public demo, named by `DEMO_ACCOUNT_EMAIL`, so its password cannot be rotated |
 
 ---
 
@@ -293,7 +294,7 @@ Last 50 audit events, newest first. **200**
 
 `type` is one of `register`, `login`, `logout`, `logout_all`, `token_refresh`,
 `token_reuse_detected`, `password_change`, `profile_update`, `session_revoked`,
-`account_locked`, `rate_limited`.
+`account_locked`.
 
 ---
 
@@ -355,7 +356,7 @@ vault cannot be used to probe for other people's item ids.
 | `204` | Logout, password change, session revoke, vault delete |
 | `400` | Malformed input, weak password |
 | `401` | Not authenticated, or credentials rejected |
-| `403` | Authenticated but not permitted; CSRF failure |
+| `403` | Authenticated but not permitted: CSRF failure, or the protected demo account |
 | `404` | No such route or resource — also used instead of `403` where existence is itself a secret |
 | `409` | Email already registered |
 | `413` | Body over 32 kB |

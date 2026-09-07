@@ -191,8 +191,10 @@ generate one. The only credential in this repository is the seeded demo password
 ## Audit log
 
 `auth_events` is append-only and records register, login (success and failure), logout,
-logout-all, refresh, **reuse detection**, password change, profile update, session revocation,
-lockout and rate limiting — each with outcome, IP and user agent. Users see their own log at
+logout-all, refresh, **reuse detection**, password change, profile update, session revocation and
+account lockout — each with outcome, IP and user agent. Lockout is recorded on the transition into
+the lock rather than per rejected attempt. Rate-limited requests are deliberately *not* audited: a
+row per throttled request would turn the limiter into an amplifier for the flood it exists to shed. Users see their own log at
 `/sessions`. Writing an audit row can never fail a request: the insert is wrapped so a logging
 problem does not become an availability problem.
 
